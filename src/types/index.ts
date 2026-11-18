@@ -1,0 +1,936 @@
+// ─────────────────────────────────────────────
+// PRison Control — Core Types & Firestore Models
+// ─────────────────────────────────────────────
+
+export type ParticipantStatus = 'active' | 'inactive' | 'flagged' | 'escaped';
+export type RepositoryStatus = 'active' | 'inactive' | 'archived';
+export type PRProcessingState = 'AUTO_APPROVED' | 'PENDING_REVIEW' | 'REJECTED' | 'MERGED';
+export type PRStatus = 'open' | 'merged' | 'closed' | 'flagged' | 'pending' | PRProcessingState;
+export type EventStatus = 'ongoing' | 'completed' | 'upcoming';
+export type TestStatus = 'passing' | 'failing' | 'skipped' | 'pending';
+
+// ── OFFLINE HACKATHON ISSUE & TEAM MODELS ───────────
+
+export type IssueDifficulty = 'EASY' | 'MEDIUM' | 'HARD' | 'VERY_HARD';
+
+export const ISSUE_DIFFICULTY_POINTS: Record<IssueDifficulty, number> = {
+  EASY: 10,
+  MEDIUM: 20,
+  HARD: 30,
+  VERY_HARD: 40,
+};
+
+export type IssueGradingStatus =
+  | 'UNGRADED'
+  | 'GRADED'
+  | 'PENDING'
+  | 'REJECTED'
+  | 'RECEIVED'
+  | 'WAITING_FOR_TESTS'
+  | 'AUTO_GRADED'
+  | 'PENDING_REVIEW'
+  | 'APPROVED'
+  | 'MERGED'
+  | 'GRADING_FAILED';
+
+export type GradingStatus =
+  | 'RECEIVED'
+  | 'WAITING_FOR_TESTS'
+  | 'AUTO_GRADED'
+  | 'PENDING_REVIEW'
+  | 'APPROVED'
+  | 'REJECTED'
+  | 'MERGED'
+  | 'GRADING_FAILED';
+
+export interface IssueComponentScores {
+  correctness: number; // 0.00 to 1.00 (weight 0.70)
+  codeQuality: number; // 0.00 to 1.00 (weight 0.20)
+  commitQuality: number; // 0.00 to 1.00 (weight 0.10)
+}
+
+export interface IssueGradingRecord {
+  issueNumber: number;
+  difficulty: IssueDifficulty;
+  basePoints: number; // 10, 20, 30, or 40
+  maxPoints: number;
+  rawComponentScores: IssueComponentScores;
+  formula: string; // "basePoints * (0.70 * C + 0.20 * Q + 0.10 * M)"
+  rubricVersion: string; // e.g. "v1.0-beginner-java"
+  awardedPoints: number; // rounded to 2 decimal places
+  gradingStatus: GradingStatus;
+  gradingExplanation: string;
+  gradedAt: string;
+  configVersion?: number;
+  gradingRunId?: string;
+  weightedContribution?: {
+    correctness: number;
+    codeQuality: number;
+    commitQuality: number;
+  };
+  humanReviewAdjustment?: {
+    previousScore: number;
+    newScore: number;
+    adminUsername: string;
+    reason: string;
+    timestamp: string;
+  };
+  deductions: {
+    correctness: string[];
+    codeQuality: string[];
+    commitQuality: string[];
+  };
+  evidence: {
+    compilationPassed: boolean;
+    testsPassed?: number;
+    testsFailed?: number;
+    totalTests?: number;
+    normalInputsPassed?: boolean;
+    edgeCasesPassed?: boolean;
+    testTamperingDetected: boolean;
+    scopeViolations?: string[];
+    unassignedIssueDetected: boolean;
+    authorMismatch: boolean;
+    sandboxAvailable: boolean;
+    hardcodedOutputDetected?: boolean;
+    conceptBypassed?: boolean;
+    emptyCommitsDetected?: boolean;
+    duplicateCommitsDetected?: boolean;
+    formattingOnlyDetected?: boolean;
+    isStructurallyAlternative?: boolean;
+  };
+}
+
+export interface FirestoreIssue {
+  id: string; // e.g. "issue_squard_1_10"
+  repositoryId: string;
+  repositoryFullName?: string;
+  issueNumber: number;
+  title: string;
+  difficulty: IssueDifficulty;
+  basePoints: number; // 10, 20, 30, or 40
+  assignedStudentId?: string;
+  assignedStudentUsername?: string;
+  teamId?: string;
+  url: string;
+  active: boolean;
+  gradingStatus: IssueGradingStatus;
+  correctnessScore?: number;
+  qualityScore?: number;
+  commitQualityScore?: number;
+  finalScore?: number;
+  rawComponentScores?: IssueComponentScores;
+  rubricVersion?: string;
+  maxPoints?: number;
+  awardedPoints?: number;
+  gradingExplanation?: string;
+  gradedAt?: string;
+  deductions?: {
+    correctness: string[];
+    codeQuality: string[];
+    commitQuality: string[];
+  };
+  evidence?: Record<string, any>;
+  labels?: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type Issue = FirestoreIssue;
+
+export interface TeamMember {
+  studentId: string;
+  name: string;
+  githubUsername: string;
+  teamId?: string;
+  repositoryId?: string;
+  assignedIssues: number[];
+  prSubmitted?: boolean;
+  prNumber?: number;
+  prUrl?: string;
+  prStatus?: string;
+  issueScores?: Record<number, number>;
+  score?: number;
+  totalScore?: number;
+  validationStatus?: string;
+}
+
+export interface SolvedIssue {
+  issueNumber: number;
+  difficulty: IssueDifficulty;
+  points: number;
+  solvedByUsername: string;
+  prNumber: number;
+  solvedAt: string;
+  title?: string;
+  correctnessScore?: number; // C normalized (0 - 1.0)
+  codeQualityScore?: number; // Q normalized (0 - 1.0)
+  commitQualityScore?: number; // M normalized (0 - 1.0)
+  explanation?: string;
+  prStatus?: string;
+}
+
+export interface FirestoreTeam {
+  id: string; // e.g. "team_squard_1"
+  name: string; // e.g. "Squad 1"
+  repositoryId: string; // e.g. "squard_1"
+  repositoryName: string; // e.g. "squard_1" (The actual registered repository name displayed on public leaderboard)
+  repositoryFullName?: string; // e.g. "PRison-Break-2026/squard_1"
+  members: TeamMember[]; // Registered student members (default 4, or approved 5)
+  configuredTeamSize?: number; // 4 or 5 (default 4)
+  sizeChangeReason?: string;
+  sizeApprovedBy?: string;
+  earnedXP?: number; // XP earned solely from validated issue solutions
+  bonusXP?: number; // Manual bonus XP awarded by administrators
+  totalXP?: number; // Combined total XP: totalXP = earnedXP + bonusXP
+  totalScore: number; // Backward-compatible aggregate score (= totalXP)
+  assignedIssueCount: number; // Number of assigned issues
+  validatedIssueCount: number; // Number of correctly solved issues
+  correctlySolvedIssuesCount?: number;
+  veryHardSolvedCount: number; // Number of accurately solved Very Hard issues
+  veryHardScore?: number; // Total points from Very Hard solved issues
+  correctnessScoreTotal?: number; // Total correctness score across validated issues
+  validSubmissionsCount?: number; // Number of registered students with valid submissions
+  // Build-from-Scratch Hackathon fields
+  problemStatement?: string;
+  problemTitle?: string;
+  githubUrl?: string;
+  repoOwner?: string;
+  repoName?: string;
+  repoAccessStatus?: 'ACCESSIBLE' | 'PRIVATE_OR_UNAUTHORIZED' | 'MISSING' | 'EMPTY' | 'RATE_LIMITED' | 'NETWORK_ERROR' | 'UNKNOWN';
+  buildSubmissionStatus?: 'PENDING' | 'SUBMITTED' | 'INACCESSIBLE' | 'EMPTY' | 'EVALUATED' | 'AWAITING_PUSH';
+  submissionStatus?: string;
+  evaluationStatus?: 'NOT_STARTED' | 'IN_PROGRESS' | 'COMPLETED' | 'FLAGGED' | 'FAILED' | 'REVIEW_REQUIRED';
+  lastEvaluationTimestamp?: string;
+  facultyScore?: number;
+  facultyMaxScore?: number;
+  facultyEvaluation?: FacultyEvaluation;
+  gitProcessScore?: number;
+  latestEvaluationReport?: RepoEvaluationReport;
+  rankingScore?: number;
+  rankingStatus?: 'PENDING_FACULTY' | 'PENDING_EVALUATION' | 'REVIEW_REQUIRED' | 'FINALIZED' | 'AWAITING_PUSH';
+  checkpoints?: Record<string, { verified: boolean; score?: number }>;
+  scoreBreakdown?: {
+    facultyContribution: number;
+    gitProcessContribution: number;
+    bonusXP: number;
+    rankingScore: number;
+    isPendingFaculty: boolean;
+    isPendingGit: boolean;
+    explanation?: string;
+    facultyWeight?: number;
+    gitWeight?: number;
+  };
+  prsSubmitted: number;
+  solvedIssues: SolvedIssue[];
+  lastMergedAt?: string | null;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Team extends FirestoreTeam {
+  rank: number;
+  previousRank: number;
+  rankText?: string; // e.g. "#1" or "T-1"
+  isTied?: boolean;
+}
+
+export interface AwardsSummary {
+  champions: Team[]; // 1st Place — PRison Break Champions (may be tied)
+  runnerUp: Team[]; // 2nd Place — Runner-Up
+  thirdPlace: Team[]; // 3rd Place — Third Place
+  veryHardSpecialist: {
+    winners: Team[];
+    highestCount: number;
+    highestScore: number;
+    isTied: boolean;
+  };
+}
+
+export interface BonusTransaction {
+  id: string; // e.g. "bonus_tx_1712345678"
+  teamId: string;
+  teamName?: string;
+  repositoryName?: string;
+  amount: number; // strictly positive
+  reason: string; // mandatory reason
+  adminId?: string;
+  adminUsername: string;
+  timestamp: string;
+  idempotencyKey?: string;
+  previousBonusXP?: number;
+  newBonusXP?: number;
+  previousTotalXP?: number;
+  newTotalXP?: number;
+}
+
+export interface ChallengeMapping {
+  id: string;
+  repositoryName: string; // e.g. "Squade_1"
+  issueNumber: number;
+  difficulty: IssueDifficulty;
+  basePoints: number;
+  title: string;
+  topic?: string;
+  starterFile: string;
+  solutionFile?: string;
+  hasSolution: boolean;
+  expectedOutput: string;
+  hasExistingTests: boolean;
+  missingTestsReport: boolean;
+  isAmbiguous: boolean;
+  needsOrganizerReview: boolean;
+  reviewNotes?: string;
+  verifiedAt?: string;
+}
+
+export interface ChallengeRepoImportSummary {
+  repositoryName: string;
+  issuesFound: number;
+  solutionsFound: number;
+  missingSolutions: string[];
+  missingTests: string[];
+  duplicateMappings: string[];
+  conflicts: string[];
+  status: 'VALIDATED' | 'WARNINGS' | 'FLAGGED_FOR_REVIEW';
+  warnings: string[];
+}
+
+export interface PrivateReferenceSolution {
+  id: string; // e.g. "sol_Squade_1_Issue01"
+  repositoryName: string;
+  issueNumber: number;
+  fileName: string;
+  starterPath: string;
+  solutionPath: string;
+  expectedOutput: string;
+  topic?: string;
+  difficulty: IssueDifficulty;
+  correctionNotes?: string;
+  hiddenAssertions?: string[];
+  isPrivate: true;
+  createdAt: string;
+}
+
+export interface AdminAuditLog {
+  id: string;
+  action:
+    | 'PARTICIPANT_REPLACEMENT'
+    | 'REPOSITORY_REASSIGNMENT'
+    | 'TEAM_ACTIVATION'
+    | 'TEAM_DEACTIVATION'
+    | 'ISSUE_REASSIGNMENT'
+    | 'SCORE_OVERRIDE'
+    | 'MANUAL_GRADING_OVERRIDE'
+    | 'TEST_MANIPULATION_DETECTED'
+    | 'ATTRIBUTION_CONFLICT'
+    | 'PR_APPROVAL'
+    | 'PR_REJECTION'
+    | 'PR_REQUEST_REVIEW'
+    | 'MANUAL_BONUS_AWARD'
+    | 'TEAM_SIZE_CHANGED'
+    | 'CHALLENGE_REPO_IMPORTED'
+    | 'MAPPING_CORRECTION'
+    | 'REPO_EVALUATION_APPROVED'
+    | 'REPO_EVALUATION_OVERRIDDEN'
+    | 'FACULTY_SCORE_UPDATED'
+    | 'EVENT_MODE_CHANGED'
+    | 'CHECKPOINT_CONFIG_UPDATED';
+  teamId?: string;
+  repositoryId?: string;
+  issueNumber?: number;
+  prNumber?: number;
+  studentUsername?: string;
+  performedBy?: string;
+  adminUsername?: string;
+  targetId?: string;
+  targetName?: string;
+  previousValue?: any;
+  newValue?: any;
+  details: Record<string, any>;
+  reason: string;
+  timestamp: string;
+}
+
+// ── FIRESTORE SCHEMAS (Phase 2 & Phase 7) ───────────
+
+/**
+ * Collection: participants
+ */
+export interface FirestoreParticipant {
+  id: string;
+  name: string;
+  githubUsername: string;
+  avatarUrl?: string;
+  teamId?: string;
+  teamName?: string;
+  assignedIssues?: number[];
+  totalScore: number;
+  prCount: number;
+  mergedPrCount: number;
+  escapedCells: number;
+  firstSuccessfulPr?: string | null;
+  active?: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Collection: repositories
+ */
+export interface FirestoreRepository {
+  id: string;
+  owner: string;
+  name: string;
+  fullName: string;
+  githubUrl: string;
+  teamId?: string;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ValidationChecks {
+  participantRegistered: boolean;
+  repositoryRegistered: boolean;
+  issueValid: boolean;
+  testsPassed: boolean;
+  filesValid: boolean;
+}
+
+export interface FirestorePullRequest {
+  id: string;
+  repositoryId: string;
+  repositoryFullName?: string;
+  prNumber: number;
+  githubUsername: string;
+  issueNumber: number;
+  issueNumbers?: number[];
+  solvedIssueNumbers?: number[];
+  issueDifficulty?: IssueDifficulty;
+  solvedIssues?: SolvedIssue[];
+  teamId?: string;
+  hasMultiplePRViolation?: boolean;
+  title: string;
+  status: PRStatus | string;
+  processingState?: PRProcessingState;
+  testsPassed: boolean;
+  correct: boolean;
+  merged: boolean;
+  score: number;
+  labels?: string[];
+  issueLabels?: string[];
+  url?: string;
+  validationChecks?: ValidationChecks;
+  validationReasons?: string[];
+  validationSignals?: {
+    participantRegistered?: boolean;
+    repositoryActive?: boolean;
+    validIssueLinked?: boolean;
+    testsPassed?: boolean;
+    filesAllowed?: boolean;
+    noSuspiciousDiff?: boolean;
+  };
+  reviewNotes?: string;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  baseBranch?: string;
+  headBranch?: string;
+  baseCommitSha?: string;
+  headCommitSha?: string;
+  commitShas?: string[];
+  commitMessages?: string[];
+  commits?: Array<{ sha: string; message: string; author?: string; email?: string; timestamp?: string }>;
+  changedFilesList?: Array<{ filename: string; status?: string; additions?: number; deletions?: number; patch?: string }>;
+  associatedAssignedIssueIds?: number[];
+  checkRunResults?: Record<string, any>;
+  isDraft?: boolean;
+  attributionWarnings?: string[];
+  duplicateSubmissionWarning?: boolean;
+  gradingRecords?: IssueGradingRecord[];
+  aiValidation?: {
+    verdict?: 'APPROVED' | 'NEEDS_CHANGES' | 'REJECTED';
+    confidence?: number;
+    summary?: string;
+    feedback?: string;
+    codeQuality?: string;
+    autoMergeAllowed?: boolean;
+    autoMergeBlockedReason?: string;
+    evaluatedAt?: string;
+    model?: string;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Collection: scoreEvents
+ */
+export interface FirestoreScoreEvent {
+  id: string;
+  teamId?: string;
+  teamName?: string;
+  participantId: string;
+  participantName?: string;
+  githubUsername?: string;
+  type: string;
+  points: number;
+  basePoints?: number;
+  componentScores?: IssueComponentScores;
+  rubricVersion?: string;
+  formula?: string;
+  prId?: string;
+  prNumber?: number;
+  repositoryId?: string;
+  repositoryFullName?: string;
+  issueId?: string;
+  issueNumber?: number;
+  reason?: string;
+  idempotencyKey?: string;
+  timestamp: string;
+}
+
+/**
+ * Collection: reviews
+ */
+export interface FirestoreReview {
+  id: string;
+  prId: string;
+  prNumber?: number;
+  repositoryId?: string;
+  status: string;
+  reason: string;
+  reviewedBy: string;
+  pointsAwarded?: number;
+  createdAt: string;
+}
+
+export interface EventScoringWeights {
+  correctness: number; // 0.70
+  codeQuality: number; // 0.20
+  commitQuality: number; // 0.10
+}
+
+export type EventMode = 'BUILD_FROM_SCRATCH' | 'LEGACY_ISSUE_PR';
+export type OfficialRankingPolicy = 'FACULTY_PRIMARY' | 'FACULTY_ONLY' | 'GIT_PROCESS_ONLY';
+
+export interface BuildFromScratchWeights {
+  faculty: number; // e.g. 0.70 (70%)
+  gitProcess: number; // e.g. 0.30 (30%)
+}
+
+export interface HackathonCheckpoint {
+  id: string;
+  displayName: string;
+  description: string;
+  criteria: string;
+  expectedEvidence?: string;
+  xpValue: number;
+  enabled: boolean;
+}
+
+export type CheckpointVerificationStatus =
+  | 'PENDING'
+  | 'VERIFIED'
+  | 'PARTIAL'
+  | 'FLAGGED'
+  | 'INSUFFICIENT_EVIDENCE'
+  | 'NOT_MET';
+
+export interface CheckpointEvaluation {
+  checkpointId: string;
+  checkpointName: string;
+  status: CheckpointVerificationStatus;
+  score: number;
+  maxScore: number;
+  explanation: string;
+  evidenceFiles: string[];
+  evidenceCommits: string[];
+  evaluator: string;
+  evaluatedAt: string;
+  notes?: string;
+}
+
+export interface GitWorkflowEvaluation {
+  score: number;
+  maxScore: number;
+  totalCommits: number;
+  meaningfulCommits: number;
+  trivialOrCosmeticCount: number;
+  emptyCommitsCount: number;
+  duplicateCommitsCount: number;
+  contributorCount: number;
+  registeredContributorsFound: string[];
+  unregisteredContributorsFound: string[];
+  commitTimelineProgression: string;
+  findings: string[];
+  flags: string[];
+}
+
+export interface CodeQualityEvaluation {
+  score: number;
+  maxScore: number;
+  structureRating: 'POOR' | 'ACCEPTABLE' | 'GOOD' | 'EXCELLENT';
+  modularityNotes: string;
+  errorHandlingNotes: string;
+  detectedIssues: string[];
+  findings: string[];
+}
+
+export interface BuildAndTestingEvaluation {
+  score: number;
+  maxScore: number;
+  detectedLanguage: string;
+  detectedBuildSystem: string;
+  detectedBuildCommands: string[];
+  detectedConfigFiles: string[];
+  hasTestCases: boolean;
+  testFiles: string[];
+  runtimeVerificationStatus: 'UNAVAILABLE' | 'PASSED' | 'FAILED' | 'SKIPPED';
+  runtimeNotes: string;
+  findings: string[];
+}
+
+export interface DocumentationEvaluation {
+  score: number;
+  maxScore: number;
+  hasReadme: boolean;
+  setupInstructionsPresent: boolean;
+  architectureDocumented: boolean;
+  testInstructionsPresent: boolean;
+  findings: string[];
+}
+
+export interface RepoEvaluationReport {
+  id: string;
+  teamId: string;
+  teamName: string;
+  repositoryUrl: string;
+  repositoryOwner: string;
+  repositoryName: string;
+  commitSha?: string;
+  evaluatedAt: string;
+  evaluationVersion: number;
+  evaluator: string;
+  categoryScores: {
+    checkpoints: number;
+    gitWorkflow: number;
+    codeQuality: number;
+    buildTesting: number;
+    documentation: number;
+  };
+  maxCategoryScores: {
+    checkpoints: number;
+    gitWorkflow: number;
+    codeQuality: number;
+    buildTesting: number;
+    documentation: number;
+  };
+  checkpoints: CheckpointEvaluation[];
+  gitWorkflow: GitWorkflowEvaluation;
+  codeQuality: CodeQualityEvaluation;
+  buildTesting: BuildAndTestingEvaluation;
+  documentation: DocumentationEvaluation;
+  totalGitProcessScore: number;
+  earnedXP: number;
+  missingEvidence: string[];
+  warnings: string[];
+  manualReviewRequired: boolean;
+  status: 'PROPOSED' | 'APPROVED' | 'OVERRIDDEN' | 'FAILED';
+  approvalDetails?: {
+    approvedBy: string;
+    approvedAt: string;
+    notes?: string;
+  };
+  overrideDetails?: {
+    overriddenBy: string;
+    overriddenAt: string;
+    previousScore: number;
+    newScore: number;
+    reason: string;
+  };
+}
+
+export interface FacultyEvaluationCriterion {
+  id: string;
+  name: string;
+  description: string;
+  maxScore: number;
+  awardedScore: number;
+  comments?: string;
+}
+
+export interface FacultyEvaluation {
+  id: string;
+  teamId: string;
+  teamName?: string;
+  facultyProblemTitle: string;
+  reviewerId: string;
+  reviewerName: string;
+  criteria: FacultyEvaluationCriterion[];
+  totalScore: number;
+  maxScore: number;
+  normalizedScore: number;
+  notes?: string;
+  status: 'PENDING' | 'IN_PROGRESS' | 'SUBMITTED' | 'FINALIZED';
+  evaluatedAt: string;
+  auditHistory?: Array<{
+    editedBy: string;
+    timestamp: string;
+    previousScore: number;
+    newScore: number;
+    reason: string;
+  }>;
+}
+
+/**
+ * Collection: eventConfig
+ */
+export interface FirestoreEventConfig {
+  eventName: string;
+  tagline?: string;
+  status: string;
+  active: boolean; // Active event status
+  eventMode?: EventMode; // 'BUILD_FROM_SCRATCH' (new default) | 'LEGACY_ISSUE_PR'
+  rankingPolicy?: OfficialRankingPolicy;
+  buildWeights?: BuildFromScratchWeights;
+  checkpoints?: HackathonCheckpoint[];
+  requiredTeamSize: number; // 4
+  maxCompetitionPRsPerStudent: number; // 1
+  difficultyPoints: {
+    EASY: number; // 10
+    MEDIUM: number; // 20
+    HARD: number; // 30
+    VERY_HARD: number; // 40
+  };
+  weights: EventScoringWeights;
+  veryHardAccuracyThreshold: number; // 0.95
+  baseBranch: string; // 'main'
+  permittedSourceFilePatterns: string[]; // ['src/**/*.java']
+  testExecutionConfig: {
+    timeoutMs: number;
+    memoryLimitMb: number;
+    sandboxProfile: string;
+  };
+  manualReviewPolicy: 'ALL' | 'FLAGGED_ONLY' | 'ANOMALIES_ONLY';
+  submissionDeadline?: string;
+  gradingFreeze: boolean;
+  version: number;
+  updatedBy?: string;
+  updateReason?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReconciliationDiscrepancy {
+  id: string;
+  type: 'CACHED_SCORE_MISMATCH' | 'DUPLICATE_ISSUE_AWARD' | 'MISSING_REFERENCE' | 'DUPLICATE_COMPETITION_PR';
+  severity: 'ERROR' | 'WARNING';
+  teamId?: string;
+  repositoryId?: string;
+  studentUsername?: string;
+  prNumber?: number;
+  issueNumber?: number;
+  cachedValue?: any;
+  calculatedValue?: any;
+  description: string;
+}
+
+export interface ReconciliationReport {
+  timestamp: string;
+  totalTeamsAudited: number;
+  totalScoreEventsAudited: number;
+  totalPullRequestsAudited: number;
+  discrepancies: ReconciliationDiscrepancy[];
+  isHealthy: boolean;
+  calculatedTeamScores: Record<string, number>;
+  cachedTeamScores: Record<string, number>;
+}
+
+/**
+ * Collection: webhookEvents
+ */
+export type WebhookProcessingStatus = 'RECEIVED' | 'PROCESSED' | 'IGNORED' | 'FAILED';
+
+export interface FirestoreWebhookEvent {
+  deliveryId: string;
+  eventType: string;
+  action: string;
+  repositoryId: string;
+  repositoryFullName: string;
+  receivedAt: string;
+  processingStatus: WebhookProcessingStatus;
+  processedAt?: string;
+  error?: string | null;
+  normalizedData?: Record<string, any>;
+  rawPayload?: Record<string, any>;
+}
+
+export type WebhookEvent = FirestoreWebhookEvent;
+
+// ── UI-FACING INTERFACES ──────────────────────────
+
+export interface Participant {
+  id: string;
+  name: string;
+  githubUsername: string;
+  avatarUrl?: string;
+  teamId?: string;
+  teamName?: string;
+  assignedIssues?: number[];
+  xp: number;
+  totalScore?: number;
+  prs: number;
+  prCount?: number;
+  mergedPRs: number;
+  mergedPrCount?: number;
+  escapedCells: number;
+  firstSuccessfulPr?: string | null;
+  active?: boolean;
+  rank: number;
+  previousRank: number;
+  status: ParticipantStatus;
+  joinedAt?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface Repository {
+  id: string;
+  name: string;
+  owner: string;
+  fullName?: string;
+  githubUrl: string;
+  teamId?: string;
+  description?: string;
+  status: RepositoryStatus;
+  active?: boolean;
+  issues: number;
+  prs: number;
+  stars: number;
+  language?: string;
+  addedAt?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface PullRequest {
+  id: string;
+  number: number;
+  title: string;
+  repository: string;
+  repositoryId?: string;
+  repositoryFullName?: string;
+  author: string;
+  githubUsername: string;
+  issueNumber?: number;
+  issueNumbers?: number[];
+  solvedIssueNumbers?: number[];
+  issueDifficulty?: IssueDifficulty;
+  solvedIssues?: SolvedIssue[];
+  teamId?: string;
+  hasMultiplePRViolation?: boolean;
+  status: PRStatus;
+  processingState?: PRProcessingState;
+  testStatus: TestStatus;
+  testsPassed?: boolean;
+  correct?: boolean;
+  merged?: boolean;
+  score: number;
+  labels?: string[];
+  issueLabels?: string[];
+  validationChecks?: ValidationChecks;
+  validationReasons?: string[];
+  validationSignals?: {
+    participantRegistered?: boolean;
+    repositoryActive?: boolean;
+    validIssueLinked?: boolean;
+    testsPassed?: boolean;
+    filesAllowed?: boolean;
+    noSuspiciousDiff?: boolean;
+  };
+  reviewNotes?: string;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  aiValidation?: {
+    verdict?: 'APPROVED' | 'NEEDS_CHANGES' | 'REJECTED';
+    confidence?: number;
+    summary?: string;
+    feedback?: string;
+    codeQuality?: string;
+    autoMergeAllowed?: boolean;
+    autoMergeBlockedReason?: string;
+    evaluatedAt?: string;
+    model?: string;
+  };
+  createdAt: string;
+  updatedAt?: string;
+  mergedAt?: string;
+  url?: string;
+  baseBranch?: string;
+  headBranch?: string;
+  baseCommitSha?: string;
+  headCommitSha?: string;
+  commitShas?: string[];
+  commitMessages?: string[];
+  commits?: Array<{ sha: string; message: string; author?: string; email?: string; timestamp?: string }>;
+  changedFilesList?: Array<{ filename: string; status?: string; additions?: number; deletions?: number; patch?: string }>;
+  associatedAssignedIssueIds?: number[];
+  checkRunResults?: Record<string, any>;
+  isDraft?: boolean;
+  attributionWarnings?: string[];
+  duplicateSubmissionWarning?: boolean;
+  gradingRecords?: IssueGradingRecord[];
+}
+
+export interface ScoreEvent {
+  id: string;
+  participantId: string;
+  participantName: string;
+  githubUsername: string;
+  teamId?: string;
+  teamName?: string;
+  event: string;
+  type?: string;
+  points: number;
+  prNumber?: number;
+  prId?: string;
+  issueNumber?: number;
+  issueId?: string;
+  difficulty?: IssueDifficulty;
+  repository?: string;
+  reason?: string;
+  timestamp: string;
+}
+
+export interface DashboardStats {
+  totalParticipants: number;
+  totalTeams?: number;
+  totalRepositories: number;
+  totalPRs: number;
+  mergedPRs: number;
+  pendingReviews: number;
+  flaggedPRs: number;
+  totalXP: number;
+  topParticipant?: string;
+  topTeam?: string;
+}
+
+export interface NavItem {
+  id: string;
+  label: string;
+  icon: string;
+  path: string;
+}
+
+export type AdminPage =
+  | 'dashboard'
+  | 'teams'
+  | 'participants'
+  | 'repositories'
+  | 'pull-requests'
+  | 'leaderboard'
+  | 'score-events'
+  | 'webhook-events'
+  | 'settings';

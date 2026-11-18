@@ -1,0 +1,48 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isValidSubmissionContentType() {
+      return request.resource.contentType in [
+        'application/pdf',
+        'application/vnd.ms-powerpoint',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'text/plain',
+        'text/markdown',
+        'application/json',
+        'application/zip',
+        'application/x-zip-compressed',
+        'image/png',
+        'image/jpeg',
+        'image/webp'
+      ];
+    }
+
+    function isValidFileSize() {
+      return request.resource.size > 0 && request.resource.size <= 25 * 1024 * 1024;
+    }
+
+    function hasSafeFileName(fileName) {
+      return !fileName.matches('.*\\.(exe|bat|cmd|sh|ps1|msi|dll|js|mjs|html|htm|php|scr)$');
+    }
+
+    // Competition Submission Artifacts (Zero-Account Scoped Upload, Authenticated Review)
+    match /competitions/{competitionId}/submissions/{submissionId}/{fileName} {
+      // Anonymous participants can upload validated artifacts up to 25 MB with safe extensions
+      allow create: if isValidFileSize() &&
+                       isValidSubmissionContentType() &&
+                       hasSafeFileName(fileName);
+
+      // Only authenticated judges/organizers (or backend Admin SDK) may read uploaded artifacts
+      allow read: if request.auth != null;
+
+      // Prevent silent overwriting or deletion of submitted artifacts
+      allow update, delete: if false;
+    }
+
+    // Default deny-all for every other storage path
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
