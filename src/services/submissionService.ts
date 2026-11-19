@@ -3,23 +3,36 @@
 // Proofly — Phase 5
 // ─────────────────────────────────────────────
 
-import { db, isFirebaseConfigured } from '../config/firebase';
 import {
   collection,
   doc,
   setDoc,
   getDoc,
   getDocs,
+  limit,
   query,
+  runTransaction,
+  startAfter,
   where,
+  type QueryConstraint,
 } from 'firebase/firestore';
 import { generateSecureToken, sha256Hash, timingSafeEqualStrings } from '../utils/cryptoUtils';
 import { sanitizeFirestoreData } from '../utils/firestoreUtils';
+import {
+  clampPageSize,
+  mapFirestoreError,
+  resolveFirestore,
+  withServerTimestamps,
+  type FirestoreExecutionOptions,
+  type PaginatedResult,
+  type PaginationOptions,
+} from './firestorePersistenceService';
 import { formValidationService } from './formValidationService';
 import { formBuilderService } from './formBuilderService';
 import { accessManagementService } from './accessManagementService';
 import { participantTeamService } from './participantTeamService';
 import { submissionLifecycleService } from './submissionLifecycleService';
+import { competitionLifecycleService } from './competitionLifecycleService';
 import { competitionService } from './competitionService';
 import { evaluationQueueService } from './evaluationQueueService';
 import type { SubmissionFormSchema } from '../types/formAndAccess';
@@ -33,41 +46,10 @@ import type {
 } from '../types/submission';
 import type { Competition } from '../types/authAndCompetition';
 
-const SUBMISSIONS_STORAGE_KEY = 'proofly_submissions_v1';
-
 export class SubmissionService {
+  // Unit-test-only in-memory store (unused whenever Firestore is active)
   private memSubmissions: Map<string, ProjectSubmission> = new Map();
-
-  constructor() {
-    this.loadFromStorage();
-  }
-
-  private loadFromStorage(): void {
-    try {
-      if (typeof window === 'undefined' || !window.localStorage) return;
-      const raw = window.localStorage.getItem(SUBMISSIONS_STORAGE_KEY);
-      if (raw) {
-        const list = JSON.parse(raw) as ProjectSubmission[];
-        if (Array.isArray(list)) {
-          list.forEach((s) => this.memSubmissions.set(s.id, s));
-        }
-      }
-    } catch {
-      // Ignore storage errors
-    }
-  }
-
-  private saveToStorage(): void {
-    try {
-      if (typeof window === 'undefined' || !window.localStorage) return;
-      window.localStorage.setItem(
-        SUBMISSIONS_STORAGE_KEY,
-        JSON.stringify(Array.from(this.memSubmissions.values()))
-      );
-    } catch {
-      // Ignore storage errors
-    }
-  }
+  private submissionReservationCounts: Map<string, number> = new Map();
 
   /**
    * Generates a readable reference ID, e.g. "PF-SUB-2026-K9X2"
@@ -82,7 +64,7 @@ export class SubmissionService {
   }
 
   /**
-   * Intelligently maps standard submission payload attributes to schema fields.
+   * Intelligently maps standard submission payload attributes to schema fields without fabricating dummy content.
    */
   private mapPayloadToSchemaFields(
     schema: SubmissionFormSchema,
@@ -100,26 +82,28 @@ export class SubmissionService {
       const isDescField =
         idLower.includes('desc') ||
         labelLower.includes('description') ||
-        labelLower.includes('overview') ||
-        labelLower.includes('solution');
+        labelLower.includes('overview');
       const isGithubField =
         idLower.includes('git') ||
         labelLower.includes('github') ||
         field.type === 'GITHUB_URL';
 
-      if (isTitleField && payload.projectTitle) {
+      if (isTitleField && payload.projectTitle !== undefined) {
         values[field.id] = payload.projectTitle;
         continue;
       }
-      if (isDescField && payload.projectDescription) {
-        let desc = payload.projectDescription;
-        if (field.validation?.minLength && desc.length < field.validation.minLength) {
-          desc = desc.padEnd(field.validation.minLength, ' — comprehensive architectural overview provided.');
+      if (isDescField) {
+        const descParts = [
+          payload.projectDescription,
+          payload.problemStatement ? `Problem: ${payload.problemStatement}` : '',
+          payload.solution ? `Solution: ${payload.solution}` : '',
+        ].filter(Boolean);
+        if (descParts.length > 0) {
+          values[field.id] = descParts.join('\n\n');
+          continue;
         }
-        values[field.id] = desc;
-        continue;
       }
-      if (isGithubField && payload.githubUrl) {
+      if (isGithubField && payload.githubUrl !== undefined) {
         values[field.id] = payload.githubUrl;
         continue;
       }
@@ -130,83 +114,98 @@ export class SubmissionService {
 
       // Title
       if (idLower.includes('title') || labelLower.includes('title')) {
-        values[field.id] = payload.projectTitle;
+        if (payload.projectTitle !== undefined) {
+          values[field.id] = payload.projectTitle;
+        }
       }
       // Tagline / Elevator Pitch
       else if (idLower.includes('tagline') || labelLower.includes('tagline') || labelLower.includes('elevator')) {
-        const descPreview = (payload.projectDescription || '').substring(0, 100);
-        values[field.id] = descPreview.length >= 10 ? descPreview : 'AI-powered evaluation platform innovation';
+        const candidate = payload.fieldValues?.[field.id] || payload.problemStatement || payload.projectDescription;
+        if (candidate) {
+          values[field.id] = candidate.length > 140 ? candidate.substring(0, 137) + '...' : candidate;
+        }
       }
       // Track
       else if (idLower.includes('track') || labelLower.includes('track') || labelLower.includes('category')) {
         const options = field.validation?.options || [];
-        const matchingTrack = payload.track || competition.tracks?.find((t) => options.includes(t));
-        values[field.id] = payload.track || matchingTrack || (options.length > 0 ? options[0] : (competition.tracks?.[0] || 'Open Track'));
+        const matchingTrack = payload.track || competition?.tracks?.find((t) => options.includes(t));
+        values[field.id] = payload.track || matchingTrack || (competition?.tracks?.[0] || (competition?.isOpenTrackEnabled !== false ? 'Open Track' : undefined));
       }
-      // Description / Solution overview
+      // Description / Solution overview / Problem Statement
       else if (
         idLower.includes('desc') ||
         labelLower.includes('description') ||
         labelLower.includes('overview') ||
+        idLower.includes('solution') ||
         labelLower.includes('solution')
       ) {
-        let desc = payload.projectDescription || '';
-        if (field.validation?.minLength && desc.length < field.validation.minLength) {
-          desc = desc.padEnd(field.validation.minLength, ' — comprehensive architectural overview provided.');
+        const descParts = [
+          payload.projectDescription,
+          payload.problemStatement ? `Problem: ${payload.problemStatement}` : '',
+          payload.solution ? `Solution: ${payload.solution}` : '',
+        ].filter(Boolean);
+        if (descParts.length > 0) {
+          values[field.id] = descParts.join('\n\n');
         }
-        values[field.id] = desc;
       }
       // Pitch Deck / File Upload
       else if (field.type === 'FILE_UPLOAD' || field.type === 'MULTIPLE_FILE_UPLOAD') {
-        const matchingFiles = (payload.files || []).filter((f) => f.fieldId === field.id);
+        const matchingFiles = (payload.files || []).filter((f) => f.fieldId === field.id || !f.fieldId);
         if (matchingFiles.length > 0) {
           values[field.id] = field.type === 'FILE_UPLOAD' ? matchingFiles[0] : matchingFiles;
-        } else if (!field.required) {
-          // Do not set non-required files so they stay undefined/empty
         }
       }
-      // GitHub
+      // GitHub URL
       else if (
         idLower.includes('git') ||
         labelLower.includes('github') ||
         field.type === 'GITHUB_URL'
       ) {
-        values[field.id] = payload.githubUrl || 'https://github.com/proofly-demo/sample-project';
+        if (payload.githubUrl !== undefined) {
+          values[field.id] = payload.githubUrl;
+        }
       }
       // Demo URL
       else if (
         idLower.includes('demo') &&
         (field.type === 'URL' || labelLower.includes('deployed') || labelLower.includes('live'))
       ) {
-        values[field.id] = payload.deploymentUrl;
+        if (payload.deploymentUrl !== undefined) {
+          values[field.id] = payload.deploymentUrl;
+        }
       }
       // Video
       else if (idLower.includes('video') || labelLower.includes('video') || field.type === 'VIDEO_URL') {
-        values[field.id] = payload.videoUrl;
+        if (payload.videoUrl !== undefined) {
+          values[field.id] = payload.videoUrl;
+        }
       }
       // Team Members Repeater
       else if (idLower.includes('team') || labelLower.includes('team') || field.type === 'TEAM_MEMBER_REPEATER') {
-        const membersList = (payload.participants || [])
-          .filter((p) => p && p.name && p.name.trim().length > 0)
-          .map((p) => ({
+        const validParticipants = (payload.participants || []).filter(
+          (p) => p && p.name && p.name.trim().length > 0
+        );
+        if (validParticipants.length > 0) {
+          values[field.id] = validParticipants.map((p) => ({
             fullName: p.name.trim(),
-            email: p.email?.trim() || 'participant@example.com',
-            role: p.role?.trim() || 'Member',
+            email: p.email?.trim() || payload.primaryContactEmail?.trim() || '',
+            role: p.role?.trim() || (p.isLead ? 'Team Lead' : 'Member'),
             githubUsername: p.githubUsername?.trim(),
           }));
-        if (membersList.length === 0 && payload.primaryContactName) {
-          membersList.push({
-            fullName: payload.primaryContactName.trim(),
-            email: payload.primaryContactEmail?.trim() || 'solo@example.com',
-            role: 'Solo Creator',
-            githubUsername: undefined,
-          });
+        } else if (payload.primaryContactName) {
+          values[field.id] = [
+            {
+              fullName: payload.primaryContactName.trim(),
+              email: payload.primaryContactEmail?.trim() || '',
+              role: 'Solo Creator',
+              githubUsername: undefined,
+            },
+          ];
         }
-        values[field.id] = membersList;
       }
       // Checkbox (Pledge/Terms)
       else if (field.type === 'CHECKBOX') {
-        values[field.id] = true;
+        values[field.id] = payload.fieldValues?.[field.id] ?? true;
       }
     }
 
@@ -263,173 +262,219 @@ export class SubmissionService {
       throw new Error('Session token does not match target competition.');
     }
 
-    // 3. Check competition status & deadline
+    // 3. Check competition status & deadline via state machine
     const now = new Date();
+    const acceptance = competitionLifecycleService.canAcceptSubmissions(competition, now);
+    if (!acceptance.accepted) {
+      throw new Error(acceptance.reason);
+    }
+
     const deadline = new Date(competition.policies.submissionDeadline);
-    const isPastDeadline = now.getTime() > deadline.getTime();
-    let isLate = false;
+    const isLate = now.getTime() > deadline.getTime();
 
-    if (isPastDeadline) {
-      if (!competition.policies.allowLateSubmissions) {
-        throw new Error(
-          `Submissions are closed for this competition (deadline: ${deadline.toLocaleString()}). Late submissions are not accepted.`
+    // 4. Validate team vs individual policies & team size caps
+    if (submissionType === 'INDIVIDUAL') {
+      if (!competition.policies.individualSubmissionsAllowed && competition.participationType === 'TEAM') {
+        throw new Error('Individual submissions are not allowed for this competition. Team submission required.');
+      }
+      const memberCount = (participants && participants.length > 0) ? participants.length : 1;
+      if (memberCount > 1) {
+        throw new Error('Individual submissions cannot have multiple team members.');
+      }
+    } else if (submissionType === 'TEAM') {
+      if (!competition.policies.teamSubmissionsEnabled && competition.participationType === 'INDIVIDUAL') {
+        throw new Error('Team submissions are not allowed for this competition. Individual submission required.');
+      }
+      if (!teamName || !teamName.trim()) {
+        throw new Error('Team name is required for team submissions.');
+      }
+      const memberCount = (participants && participants.length > 0) ? participants.length : (primaryContactName ? 1 : 0);
+      if (competition.policies.minTeamMembers && memberCount < competition.policies.minTeamMembers) {
+        throw new Error(`Team must have at least ${competition.policies.minTeamMembers} member(s). Current count: ${memberCount}.`);
+      }
+      if (competition.policies.maxTeamMembers && memberCount > competition.policies.maxTeamMembers) {
+        throw new Error(`Team cannot exceed ${competition.policies.maxTeamMembers} member(s). Current count: ${memberCount}.`);
+      }
+    }
+
+    // 5. Atomic submission limit check (burst-safe)
+    const maxSubs = competition.policies?.maxSubmissions;
+    let reservedCompId: string | null = null;
+    if (maxSubs !== undefined) {
+      const existingInMem = Array.from(this.memSubmissions.values()).filter(
+        (s) => s.competitionId === competitionId
+      ).length;
+      const currentReserved = this.submissionReservationCounts.get(competitionId) ?? existingInMem;
+      if (currentReserved >= maxSubs) {
+        throw new Error(`Maximum submission limit of ${maxSubs} reached for this competition.`);
+      }
+      this.submissionReservationCounts.set(competitionId, currentReserved + 1);
+      reservedCompId = competitionId;
+    }
+
+    try {
+      // 6. Validate form values against active schema (NO FABRICATION)
+      const schema =
+        (await formBuilderService.getFormSchema(competitionId)) ||
+        formBuilderService.generateDefaultHackathonSchema(competitionId, competition.organizationId);
+
+      // Merge standard fields into fieldValues for complete schema validation
+      const mergedValues = this.mapPayloadToSchemaFields(schema, payload, competition);
+
+      if (!isDraft) {
+        const formValidation = formValidationService.validateFormValues(schema, mergedValues);
+        if (!formValidation.valid) {
+          const errorMsg = formValidation.errors.map((e) => `${e.fieldLabel}: ${e.message}`).join('; ');
+          throw new Error(`Validation failed: ${errorMsg}`);
+        }
+      }
+
+      // 7. Generate IDs & Cryptographic Tokens
+      const submissionId = `sub_${Math.random().toString(36).substring(2, 10)}`;
+      const referenceId = this.generateReferenceId();
+      const rawManagementToken = `sec_${generateSecureToken(32)}`;
+      const managementTokenHash = await sha256Hash(rawManagementToken);
+      const managementTokenPrefix = rawManagementToken.substring(0, 6);
+
+      // 8. Handle Team and Participant Records
+      const teamResult = await participantTeamService.handleSubmissionTeamAndMembers({
+        competitionId,
+        organizationId: competition.organizationId,
+        submissionId,
+        submissionType,
+        teamName,
+        primaryContactName,
+        primaryContactEmail,
+        participants: participants || [],
+      });
+
+      // 9. Initial Status
+      const initialStatus: SubmissionStatus = isDraft ? 'Draft' : 'Submitted';
+      const nowIso = now.toISOString();
+
+      const initialVersion: SubmissionVersion = {
+        versionNumber: 1,
+        submittedAt: nowIso,
+        statusAtVersion: initialStatus,
+        fieldValues: mergedValues,
+        files,
+        changeSummary: isDraft ? 'Initial draft saved' : 'Initial final submission',
+      };
+
+      // 10. Construct ProjectSubmission document
+      let submission: ProjectSubmission = {
+        id: submissionId,
+        referenceId,
+        competitionId,
+        organizationId: competition.organizationId,
+        formSchemaId: schema.id,
+        accessKeyId: sessionValidation.session.keyId,
+        sessionTokenId: sessionValidation.session.sessionToken,
+        participantSessionId: sessionValidation.session.sessionToken,
+
+        submissionType,
+        teamId: teamResult.team?.id,
+        teamName: teamResult.team?.name,
+        participants: teamResult.participants,
+        primaryContactName,
+        primaryContactEmail,
+
+        projectTitle,
+        projectDescription,
+        track: track || mergedValues.track || (competition.isOpenTrackEnabled ? 'Open Track' : competition.tracks?.[0] || 'Open Track'),
+        problemStatement,
+        solution,
+        technologiesUsed,
+        githubUrl,
+        deploymentUrl,
+        videoUrl,
+
+        fieldValues: mergedValues,
+        files,
+
+        status: initialStatus,
+        statusHistory: [
+          {
+            status: initialStatus,
+            changedAt: nowIso,
+            changedBy: 'participant',
+            note: isDraft ? 'Draft created' : 'Project submitted by participant',
+          },
+        ],
+
+        submittedAt: isDraft ? undefined : nowIso,
+        isLate,
+        isLocked: false,
+
+        currentVersion: 1,
+        versions: [initialVersion],
+
+        managementTokenHash,
+        managementTokenPrefix,
+
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      // 11. If final submit, trigger automatic transition to Validating -> Queued for AI Evaluation
+      if (!isDraft) {
+        const validatingStep = submissionLifecycleService.transitionStatus(
+          submission,
+          'Validating',
+          { id: 'system' },
+          'Automated file & schema integrity checks'
         );
-      }
-      isLate = true;
-    }
+        if (validatingStep.valid && validatingStep.updatedSubmission) {
+          submission = validatingStep.updatedSubmission;
+        }
 
-    // 4. Validate form values against active schema
-    const schema =
-      (await formBuilderService.getFormSchema(competitionId)) ||
-      formBuilderService.generateDefaultHackathonSchema(competitionId, competition.organizationId);
-
-    // Merge standard fields into fieldValues for complete schema validation
-    const mergedValues = this.mapPayloadToSchemaFields(schema, payload, competition);
-
-    if (!isDraft) {
-      const formValidation = formValidationService.validateFormValues(schema, mergedValues);
-      if (!formValidation.valid) {
-        const errorMsg = formValidation.errors.map((e) => `${e.fieldLabel}: ${e.message}`).join('; ');
-        throw new Error(`Validation failed: ${errorMsg}`);
-      }
-    }
-
-    // 5. Generate IDs & Cryptographic Tokens
-    const submissionId = `sub_${Math.random().toString(36).substring(2, 10)}`;
-    const referenceId = this.generateReferenceId();
-    const rawManagementToken = `sec_${generateSecureToken(32)}`;
-    const managementTokenHash = await sha256Hash(rawManagementToken);
-    const managementTokenPrefix = rawManagementToken.substring(0, 6);
-
-    // 6. Handle Team and Participant Records
-    const teamResult = await participantTeamService.handleSubmissionTeamAndMembers({
-      competitionId,
-      organizationId: competition.organizationId,
-      submissionId,
-      submissionType,
-      teamName,
-      primaryContactName,
-      primaryContactEmail,
-      participants: participants || [],
-    });
-
-    // 7. Initial Status
-    const initialStatus: SubmissionStatus = isDraft ? 'Draft' : 'Submitted';
-    const nowIso = now.toISOString();
-
-    const initialVersion: SubmissionVersion = {
-      versionNumber: 1,
-      submittedAt: nowIso,
-      statusAtVersion: initialStatus,
-      fieldValues: mergedValues,
-      files,
-      changeSummary: isDraft ? 'Initial draft saved' : 'Initial final submission',
-    };
-
-    // 8. Construct ProjectSubmission document
-    // NOTE: rawManagementToken is NEVER saved here!
-    let submission: ProjectSubmission = {
-      id: submissionId,
-      referenceId,
-      competitionId,
-      organizationId: competition.organizationId,
-      formSchemaId: schema.id,
-      accessKeyId: sessionValidation.session.keyId,
-      sessionTokenId: sessionValidation.session.sessionToken,
-
-      submissionType,
-      teamId: teamResult.team?.id,
-      teamName: teamResult.team?.name,
-      participants: teamResult.participants,
-      primaryContactName,
-      primaryContactEmail,
-
-      projectTitle,
-      projectDescription,
-      track: track || mergedValues.track || (competition.isOpenTrackEnabled ? 'Open Track' : competition.tracks?.[0] || 'Open Track'),
-      problemStatement,
-      solution,
-      technologiesUsed,
-      githubUrl,
-      deploymentUrl,
-      videoUrl,
-
-      fieldValues: mergedValues,
-      files,
-
-      status: initialStatus,
-      statusHistory: [
-        {
-          status: initialStatus,
-          changedAt: nowIso,
-          changedBy: 'participant',
-          note: isDraft ? 'Draft created' : 'Project submitted by participant',
-        },
-      ],
-
-      submittedAt: isDraft ? undefined : nowIso,
-      isLate,
-      isLocked: false,
-
-      currentVersion: 1,
-      versions: [initialVersion],
-
-      managementTokenHash,
-      managementTokenPrefix,
-
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
-
-    // 9. If final submit, trigger automatic transition to Validating -> Queued for AI Evaluation
-    if (!isDraft) {
-      const validatingStep = submissionLifecycleService.transitionStatus(
-        submission,
-        'Validating',
-        { id: 'system' },
-        'Automated file & schema integrity checks'
-      );
-      if (validatingStep.valid && validatingStep.updatedSubmission) {
-        submission = validatingStep.updatedSubmission;
-      }
-
-      const queueStep = submissionLifecycleService.transitionStatus(
-        submission,
-        'Queued for AI Evaluation',
-        { id: 'system' },
-        'Transferred to Firebase AI Logic evaluation queue'
-      );
-      if (queueStep.valid && queueStep.updatedSubmission) {
-        submission = queueStep.updatedSubmission;
-      }
-
-      // Enqueue job in reliable evaluation queue
-      try {
-        await evaluationQueueService.enqueueSubmission(
-          submission.id,
-          submission.competitionId,
-          submission.referenceId
+        const queueStep = submissionLifecycleService.transitionStatus(
+          submission,
+          'Queued for AI Evaluation',
+          { id: 'system' },
+          'Transferred to Firebase AI Logic evaluation queue'
         );
-      } catch {
-        // preserve flow
+        if (queueStep.valid && queueStep.updatedSubmission) {
+          submission = queueStep.updatedSubmission;
+        }
+
+        // Enqueue job in reliable evaluation queue
+        try {
+          await evaluationQueueService.enqueueSubmission(
+            submission.id,
+            submission.competitionId,
+            submission.referenceId,
+            submission.organizationId
+          );
+        } catch {
+          // preserve flow
+        }
       }
+
+      // 12. Persist submission
+      await this.saveSubmission(submission, { competition });
+
+      // Record submission count on access key
+      await accessManagementService.recordSubmissionUse(sessionValidation.session.keyId);
+
+      const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5173';
+      const managementUrl = `${origin}/submit/manage?ref=${referenceId}&token=${rawManagementToken}`;
+
+      return {
+        submission,
+        rawManagementToken,
+        referenceId,
+        managementUrl,
+      };
+    } catch (err) {
+      if (reservedCompId) {
+        const cur = this.submissionReservationCounts.get(reservedCompId);
+        if (cur !== undefined && cur > 0) {
+          this.submissionReservationCounts.set(reservedCompId, cur - 1);
+        }
+      }
+      throw err;
     }
-
-    // 10. Persist submission
-    await this.saveSubmission(submission);
-
-    // Record submission count on access key
-    await accessManagementService.recordSubmissionUse(sessionValidation.session.keyId);
-
-    const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5173';
-    const managementUrl = `${origin}/submit/manage?ref=${referenceId}&token=${rawManagementToken}`;
-
-    return {
-      submission,
-      rawManagementToken,
-      referenceId,
-      managementUrl,
-    };
   }
 
   /**
@@ -483,6 +528,14 @@ export class SubmissionService {
       throw new Error('This submission has been locked and can no longer be edited.');
     }
 
+    // Participants cannot set backend statuses
+    const requestedStatus = (updatedPayload as any).status;
+    if (requestedStatus && !['Draft', 'Submitted'].includes(requestedStatus)) {
+      throw new Error(
+        `Unauthorized status modification: Participants cannot transition submissions to backend status "${requestedStatus}".`
+      );
+    }
+
     // Check edit policy
     if (!competition.policies.allowSubmissionEdits && submission.status !== 'Draft') {
       throw new Error('Organizers have disabled submission edits for this competition.');
@@ -497,6 +550,12 @@ export class SubmissionService {
     if (isPastDeadline) {
       if (!competition.policies.allowLateSubmissions) {
         throw new Error('Deadline has passed. Edits or late submissions are not allowed.');
+      }
+      if (competition.policies.lateSubmissionDeadline) {
+        const lateDeadline = new Date(competition.policies.lateSubmissionDeadline).getTime();
+        if (now.getTime() > lateDeadline) {
+          throw new Error('Late submission grace period expired. Edits or submissions are no longer allowed.');
+        }
       }
       isLate = true;
     }
@@ -611,7 +670,8 @@ export class SubmissionService {
         await evaluationQueueService.enqueueSubmission(
           updated.id,
           updated.competitionId,
-          updated.referenceId
+          updated.referenceId,
+          updated.organizationId
         );
       } catch {
         // preserve flow
@@ -625,20 +685,27 @@ export class SubmissionService {
   /**
    * Fetches a submission by reference ID (e.g. "PF-SUB-2026-X9K2L").
    */
-  public async getSubmissionByReference(referenceId: string): Promise<ProjectSubmission | null> {
+  public async getSubmissionByReference(
+    referenceId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<ProjectSubmission | null> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      try {
+        const q = query(
+          collection(fs, 'submissions'),
+          where('referenceId', '==', referenceId),
+          limit(1)
+        );
+        const snaps = await getDocs(q);
+        return snaps.empty ? null : (snaps.docs[0].data() as ProjectSubmission);
+      } catch (err) {
+        throw mapFirestoreError(err, 'getSubmissionByReference', 'submissions');
+      }
+    }
+
     for (const sub of this.memSubmissions.values()) {
       if (sub.referenceId === referenceId) return sub;
-    }
-    if (isFirebaseConfigured() && db) {
-      try {
-        const q = query(collection(db, 'submissions'), where('referenceId', '==', referenceId));
-        const snaps = await getDocs(q);
-        if (!snaps.empty) {
-          return snaps.docs[0].data() as ProjectSubmission;
-        }
-      } catch {
-        // fallback
-      }
     }
     return null;
   }
@@ -646,69 +713,117 @@ export class SubmissionService {
   /**
    * Fetches a submission by its internal database ID.
    */
-  public async getSubmission(submissionId: string): Promise<ProjectSubmission | null> {
-    if (this.memSubmissions.has(submissionId)) {
-      return this.memSubmissions.get(submissionId)!;
-    }
-    if (isFirebaseConfigured() && db) {
+  public async getSubmission(
+    submissionId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<ProjectSubmission | null> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        const snap = await getDoc(doc(db, 'submissions', submissionId));
-        if (snap.exists()) {
-          return snap.data() as ProjectSubmission;
-        }
-      } catch {
-        // fallback
+        const snap = await getDoc(doc(fs, 'submissions', submissionId));
+        return snap.exists() ? (snap.data() as ProjectSubmission) : null;
+      } catch (err) {
+        throw mapFirestoreError(err, 'getSubmission', 'submissions');
       }
     }
-    return null;
+
+    return this.memSubmissions.get(submissionId) || null;
   }
 
   /**
-   * Lists all submissions across all competitions.
+   * Paginated listing of submissions across competitions (bounded via limit()).
    */
-  public async listAllSubmissions(options?: { status?: SubmissionStatus }): Promise<ProjectSubmission[]> {
+  public async listAllSubmissionsPaginated(
+    options?: { status?: SubmissionStatus } & PaginationOptions
+  ): Promise<PaginatedResult<ProjectSubmission>> {
+    const pageSize = clampPageSize(options?.pageSize);
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      try {
+        const constraints: QueryConstraint[] = [];
+        if (options?.status) {
+          constraints.push(where('status', '==', options.status));
+        }
+        constraints.push(limit(pageSize + 1));
+        if (options?.cursor) {
+          constraints.push(startAfter(options.cursor));
+        }
+        const snaps = await getDocs(query(collection(fs, 'submissions'), ...constraints));
+        const hasMore = snaps.docs.length > pageSize;
+        const pageDocs = hasMore ? snaps.docs.slice(0, pageSize) : snaps.docs;
+        const items = pageDocs
+          .map((d) => d.data() as ProjectSubmission)
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        return {
+          items,
+          hasMore,
+          nextCursor: hasMore ? pageDocs[pageDocs.length - 1] : null,
+          pageSize,
+        };
+      } catch (err) {
+        throw mapFirestoreError(err, 'listAllSubmissionsPaginated', 'submissions');
+      }
+    }
+
     const list: ProjectSubmission[] = [];
     for (const sub of this.memSubmissions.values()) {
       if (!options?.status || sub.status === options.status) {
         list.push(sub);
       }
     }
-    if (isFirebaseConfigured() && db) {
-      try {
-        const q = options?.status
-          ? query(collection(db, 'submissions'), where('status', '==', options.status))
-          : collection(db, 'submissions');
-        const snaps = await getDocs(q);
-        snaps.forEach((docSnap) => {
-          const item = docSnap.data() as ProjectSubmission;
-          if (!list.some((existing) => existing.id === item.id)) {
-            list.push(item);
-          }
-        });
-      } catch {
-        // fallback
-      }
-    }
-    return list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return {
+      items: list.slice(0, pageSize),
+      hasMore: list.length > pageSize,
+      nextCursor: null,
+      pageSize,
+    };
   }
 
-  /**
-   * Lists all submissions for a competition (alias).
-   */
+  public async listAllSubmissions(
+    options?: { status?: SubmissionStatus } & PaginationOptions
+  ): Promise<ProjectSubmission[]> {
+    const page = await this.listAllSubmissionsPaginated(options);
+    return page.items;
+  }
+
   public async listSubmissions(
     competitionId: string,
-    options?: { status?: SubmissionStatus }
+    options?: { status?: SubmissionStatus } & PaginationOptions
   ): Promise<ProjectSubmission[]> {
     return this.listCompetitionSubmissions(competitionId, options);
   }
 
-  /**
-   * Lists all submissions for a competition.
-   */
-  public async listCompetitionSubmissions(
+  public async listCompetitionSubmissionsPaginated(
     competitionId: string,
-    options?: { status?: SubmissionStatus }
-  ): Promise<ProjectSubmission[]> {
+    options?: { status?: SubmissionStatus } & PaginationOptions
+  ): Promise<PaginatedResult<ProjectSubmission>> {
+    const pageSize = clampPageSize(options?.pageSize);
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      try {
+        const constraints: QueryConstraint[] = [where('competitionId', '==', competitionId)];
+        if (options?.status) {
+          constraints.push(where('status', '==', options.status));
+        }
+        constraints.push(limit(pageSize + 1));
+        if (options?.cursor) {
+          constraints.push(startAfter(options.cursor));
+        }
+        const snaps = await getDocs(query(collection(fs, 'submissions'), ...constraints));
+        const hasMore = snaps.docs.length > pageSize;
+        const pageDocs = hasMore ? snaps.docs.slice(0, pageSize) : snaps.docs;
+        return {
+          items: pageDocs.map((d) => d.data() as ProjectSubmission),
+          hasMore,
+          nextCursor: hasMore ? pageDocs[pageDocs.length - 1] : null,
+          pageSize,
+        };
+      } catch (err) {
+        throw mapFirestoreError(err, 'listCompetitionSubmissionsPaginated', 'submissions');
+      }
+    }
+
     const list: ProjectSubmission[] = [];
     for (const sub of this.memSubmissions.values()) {
       if (sub.competitionId === competitionId) {
@@ -717,34 +832,31 @@ export class SubmissionService {
         }
       }
     }
-    if (isFirebaseConfigured() && db) {
-      try {
-        const q = options?.status
-          ? query(
-              collection(db, 'submissions'),
-              where('competitionId', '==', competitionId),
-              where('status', '==', options.status)
-            )
-          : query(collection(db, 'submissions'), where('competitionId', '==', competitionId));
-        const snaps = await getDocs(q);
-        snaps.forEach((docSnap) => {
-          const item = docSnap.data() as ProjectSubmission;
-          if (!list.some((existing) => existing.id === item.id)) {
-            list.push(item);
-          }
-        });
-      } catch {
-        // fallback
-      }
-    }
-    return list;
+    return {
+      items: list.slice(0, pageSize),
+      hasMore: list.length > pageSize,
+      nextCursor: null,
+      pageSize,
+    };
+  }
+
+  public async listCompetitionSubmissions(
+    competitionId: string,
+    options?: { status?: SubmissionStatus } & PaginationOptions
+  ): Promise<ProjectSubmission[]> {
+    const page = await this.listCompetitionSubmissionsPaginated(competitionId, options);
+    return page.items;
   }
 
   /**
    * Locks a submission from any further participant edits.
    */
-  public async lockSubmission(submissionId: string, organizerUserId: string): Promise<ProjectSubmission> {
-    const sub = await this.getSubmission(submissionId);
+  public async lockSubmission(
+    submissionId: string,
+    organizerUserId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<ProjectSubmission> {
+    const sub = await this.getSubmission(submissionId, options);
     if (!sub) throw new Error(`Submission "${submissionId}" not found.`);
 
     const updated: ProjectSubmission = {
@@ -762,28 +874,70 @@ export class SubmissionService {
       ],
     };
 
-    await this.saveSubmission(updated);
+    await this.saveSubmission(updated, options);
     return updated;
   }
 
-  public async saveSubmission(submission: ProjectSubmission): Promise<void> {
-    this.memSubmissions.set(submission.id, submission);
-    this.saveToStorage();
-    if (isFirebaseConfigured() && db) {
+  /**
+   * Persists a submission durably to Firestore (throws PersistenceError on failure; zero silent fallback).
+   */
+  public async saveSubmission(
+    submission: ProjectSubmission,
+    options?: FirestoreExecutionOptions & { competition?: Competition }
+  ): Promise<void> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await setDoc(doc(db, 'submissions', submission.id), sanitizeFirestoreData(submission));
-      } catch {
-        // memory fallback
+        const compId = submission.competitionId;
+        const comp = options?.competition;
+        if (comp?.policies?.maxSubmissions !== undefined) {
+          await runTransaction(fs, async (transaction) => {
+            const compRef = doc(fs, 'competitions', compId);
+            const compSnap = await transaction.get(compRef);
+            if (!compSnap.exists()) {
+              throw new Error(`Competition "${compId}" not found.`);
+            }
+            const compData = compSnap.data() as Competition;
+            const currentCount = compData.submissionCount || 0;
+            const maxSubs = compData.policies?.maxSubmissions;
+            if (maxSubs !== undefined && currentCount >= maxSubs) {
+              throw new Error(`Maximum submission limit of ${maxSubs} reached for this competition.`);
+            }
+
+            const subRef = doc(fs, 'submissions', submission.id);
+            transaction.set(subRef, withServerTimestamps(sanitizeFirestoreData(submission), true));
+            transaction.update(compRef, {
+              submissionCount: currentCount + 1,
+              updatedAt: new Date().toISOString(),
+            });
+          });
+          return;
+        }
+
+        await setDoc(
+          doc(fs, 'submissions', submission.id),
+          withServerTimestamps(sanitizeFirestoreData(submission), true)
+        );
+        return;
+      } catch (err) {
+        throw mapFirestoreError(err, 'saveSubmission', 'submissions');
       }
+    }
+
+    this.memSubmissions.set(submission.id, submission);
+    if (options?.competition) {
+      options.competition.submissionCount = (options.competition.submissionCount || 0) + 1;
     }
   }
 
   public clearMemoryStore(): void {
     this.memSubmissions.clear();
+    this.submissionReservationCounts.clear();
   }
 
   public resetInMemoryStore(seedList: ProjectSubmission[] = []): void {
     this.memSubmissions.clear();
+    this.submissionReservationCounts.clear();
     for (const sub of seedList) {
       this.memSubmissions.set(sub.id, sub);
     }

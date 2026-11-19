@@ -82,6 +82,20 @@ const POLICY_OPTIONS: Array<{
     badge: 'Panel Weighting',
   },
   {
+    type: 'MEDIAN',
+    title: 'Median Judge Score',
+    description:
+      'Calculates the median of finalized human judge scores, robust against outlier judgments.',
+    badge: 'Robust to Outliers',
+  },
+  {
+    type: 'TRIMMED_MEAN',
+    title: 'Trimmed Mean (Olympic Scoring)',
+    description:
+      'Excludes the lowest and highest judge scores and averages the remaining evaluations (for 3+ judges).',
+    badge: 'Olympic Exclusion',
+  },
+  {
     type: 'CRITERION_WEIGHTED',
     title: 'Criterion-Weighted Score',
     description:
@@ -158,8 +172,8 @@ export const OrganizerResultsPage: React.FC = () => {
   const [adjScore, setAdjScore] = useState<string>('');
   const [adjReason, setAdjReason] = useState<string>('');
 
-  const organizerId = currentUser?.uid || 'user-organizer-01';
-  const organizerName = currentUser?.displayName || 'Saikeerthana (Lead Organizer)';
+  const organizerId = currentUser?.uid || '';
+  const organizerName = currentUser?.displayName || 'Organizer';
 
   const refreshData = useCallback(async () => {
     const allComps = await competitionService.listAllCompetitions();

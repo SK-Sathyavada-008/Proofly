@@ -1,145 +1,87 @@
 // ─────────────────────────────────────────────
-// organizationService.ts — Organization Management & Multi-Tenancy
+// organizationService.ts — Durable Multi-Tenant Organization Persistence
+// Proofly Phase 04 — Atomic Firestore Batches/Transactions, Zero Silent Fallbacks
 // ─────────────────────────────────────────────
 
 import {
   collection,
+  collectionGroup,
   doc,
   getDoc,
   getDocs,
+  limit,
+  query,
+  runTransaction,
   setDoc,
+  startAfter,
   updateDoc,
   deleteDoc,
+  where,
+  writeBatch,
+  type QueryConstraint,
 } from 'firebase/firestore';
-import { db, isFirebaseConfigured } from '../config/firebase';
 import { sanitizeFirestoreData } from '../utils/firestoreUtils';
+import {
+  PersistenceError,
+  clampPageSize,
+  mapFirestoreError,
+  resolveFirestore,
+  withServerTimestamps,
+  type FirestoreExecutionOptions,
+  type PaginatedResult,
+  type PaginationOptions,
+} from './firestorePersistenceService';
 import type {
+  Competition,
   Organization,
   OrganizationMember,
+  OrganizationSettings,
   OrgRole,
 } from '../types/authAndCompetition';
 
-import { purgeLegacySampleStorageOnce } from '../utils/cleanSampleStorage';
-
+// Harmless UI-only preference: remembers last selected workspace tab in the browser.
+// Authoritative organizations & memberships are NEVER persisted in localStorage.
 const ACTIVE_ORG_STORAGE_KEY = 'proofly_active_org_id';
-const ORGS_STORAGE_KEY = 'proofly_organizations_v1';
-const MEMBERS_STORAGE_KEY = 'proofly_org_members_v1';
 let memoryActiveOrgId: string | null = null;
 
-// Local in-memory store for fallback/tests/offline dev
-let localOrganizations: Organization[] = [];
-let localMembers: OrganizationMember[] = [];
-
-function loadOrgsFromStorage(): void {
-  purgeLegacySampleStorageOnce();
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    const rawOrgs = window.localStorage.getItem(ORGS_STORAGE_KEY);
-    if (rawOrgs) {
-      const parsed = JSON.parse(rawOrgs);
-      if (Array.isArray(parsed)) {
-        localOrganizations = parsed;
-      }
-    }
-    const rawMembers = window.localStorage.getItem(MEMBERS_STORAGE_KEY);
-    if (rawMembers) {
-      const parsed = JSON.parse(rawMembers);
-      if (Array.isArray(parsed)) {
-        localMembers = parsed;
-      }
-    }
-  } catch {
-    // Ignore storage errors
-  }
-}
-
-function saveOrgsToStorage(): void {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    window.localStorage.setItem(ORGS_STORAGE_KEY, JSON.stringify(localOrganizations));
-    window.localStorage.setItem(MEMBERS_STORAGE_KEY, JSON.stringify(localMembers));
-  } catch {
-    // Ignore storage errors
-  }
-}
-
-loadOrgsFromStorage();
+// Unit-test-only in-memory store (used strictly when resolveFirestore() returns null in isolated unit tests)
+let unitTestOrganizations: Organization[] = [];
+let unitTestMembers: OrganizationMember[] = [];
 
 export const organizationService = {
   /**
    * Ensures a default workspace organization exists for the given user if they have none.
+   * Uses Firestore exclusively when configured; creates a unique tenant per user atomically.
    */
   async ensureDefaultOrganizationForUser(
     userId: string,
     email: string,
-    displayName: string
+    displayName: string,
+    options?: FirestoreExecutionOptions
   ): Promise<Organization> {
-    const existing = await this.getUserOrganizations(userId);
+    const existing = await this.getUserOrganizations(userId, options);
     if (existing.length > 0) {
+      this.setActiveOrganizationId(existing[0].id);
       return existing[0];
     }
 
-    const defaultOrgId = 'org-workspace';
-    const existingDefault = localOrganizations.find((o) => o.id === defaultOrgId);
-    const now = new Date().toISOString();
-
-    if (existingDefault) {
-      if (!localMembers.some((m) => m.orgId === defaultOrgId && m.userId === userId)) {
-        localMembers.push({
-          userId,
-          orgId: defaultOrgId,
-          role: existingDefault.ownerId === userId ? 'OWNER' : 'ADMIN',
-          email,
-          displayName,
-          joinedAt: now,
-        });
-        saveOrgsToStorage();
-      }
-      this.setActiveOrganizationId(defaultOrgId);
-      return existingDefault;
-    }
-
-    const defaultOrg: Organization = {
-      id: defaultOrgId,
-      name: 'Proofly Workspace',
-      slug: 'proofly-workspace',
-      tagline: '',
-      website: '',
-      ownerId: userId,
-      createdAt: now,
-      updatedAt: now,
-    };
-    const ownerMember: OrganizationMember = {
+    return this.createOrganization(
+      `${displayName || 'Organizer'}'s Workspace`,
       userId,
-      orgId: defaultOrgId,
-      role: 'OWNER',
       email,
-      displayName,
-      joinedAt: now,
-    };
-
-    localOrganizations.push(defaultOrg);
-    localMembers.push(ownerMember);
-    saveOrgsToStorage();
-    this.setActiveOrganizationId(defaultOrgId);
-
-    if (isFirebaseConfigured() && db) {
-      try {
-        await setDoc(doc(db, 'organizations', defaultOrgId), sanitizeFirestoreData(defaultOrg));
-        await setDoc(
-          doc(db, 'organizations', defaultOrgId, 'members', userId),
-          sanitizeFirestoreData(ownerMember)
-        );
-      } catch {
-        // Firestore unavailable or unauthenticated — local workspace fallback active
-      }
-    }
-
-    return defaultOrg;
+      displayName || email.split('@')[0] || 'Owner',
+      '',
+      '',
+      options
+    );
   },
 
   /**
-   * Creates a new organization and assigns the creator as the OWNER.
+   * Atomically creates a new organization AND its initial OWNER membership document
+   * in a single Firestore writeBatch (verified by existsAfter/getAfter in firestore.rules).
+   *
+   * Failure guarantee: if the Firestore batch fails, throws PersistenceError —
+   * NEVER returns a fake organization ID or falls back to localStorage.
    */
   async createOrganization(
     name: string,
@@ -147,12 +89,30 @@ export const organizationService = {
     ownerEmail: string,
     ownerName: string,
     tagline?: string,
-    website?: string
+    website?: string,
+    options?: FirestoreExecutionOptions
   ): Promise<Organization> {
-    const orgId = `org-${Math.random().toString(36).substring(2, 9)}`;
-    const slug = name
+    const trimmedName = (name || '').trim();
+    if (trimmedName.length < 2 || trimmedName.length > 120) {
+      throw new PersistenceError({
+        code: 'INVALID_ARGUMENT',
+        message: 'Organization name must be between 2 and 120 characters.',
+        operation: 'createOrganization',
+        collection: 'organizations',
+      });
+    }
+    if (!ownerId) {
+      throw new PersistenceError({
+        code: 'UNAUTHENTICATED',
+        message: 'Authenticated owner UID is required to create an organization.',
+        operation: 'createOrganization',
+        collection: 'organizations',
+      });
+    }
+
+    const orgId = `org-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 8)}`;
+    const slug = trimmedName
       .toLowerCase()
-      .trim()
       .replace(/[^\w\s-]/g, '')
       .replace(/[\s_-]+/g, '-')
       .replace(/^-+|-+$/g, '');
@@ -160,11 +120,18 @@ export const organizationService = {
     const now = new Date().toISOString();
     const newOrg: Organization = {
       id: orgId,
-      name,
+      name: trimmedName,
       slug: slug || orgId,
       tagline: tagline || '',
       website: website || '',
       ownerId,
+      settings: {
+        contactEmail: ownerEmail,
+        defaultAiMode: 'PREFER_ON_DEVICE',
+        appCheckEnforced: true,
+        updatedBy: ownerId,
+        updatedAt: now,
+      },
       createdAt: now,
       updatedAt: now,
     };
@@ -178,59 +145,361 @@ export const organizationService = {
       joinedAt: now,
     };
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await setDoc(doc(db, 'organizations', orgId), sanitizeFirestoreData(newOrg));
-        await setDoc(doc(db, 'organizations', orgId, 'members', ownerId), sanitizeFirestoreData(ownerMember));
-      } catch {
-        // Fallback to local store when Firestore rules reject unauthenticated writes
-      }
-    }
+        const batch = writeBatch(fs);
+        const orgRef = doc(fs, 'organizations', orgId);
+        const memberRef = doc(fs, 'organizations', orgId, 'members', ownerId);
 
-    localOrganizations.push(newOrg);
-    localMembers.push(ownerMember);
-    saveOrgsToStorage();
+        batch.set(orgRef, withServerTimestamps(sanitizeFirestoreData(newOrg), true));
+        batch.set(
+          memberRef,
+          withServerTimestamps(sanitizeFirestoreData(ownerMember), true)
+        );
+        await batch.commit();
+      } catch (err) {
+        throw mapFirestoreError(err, 'createOrganization', 'organizations');
+      }
+    } else {
+      unitTestOrganizations.push(newOrg);
+      unitTestMembers.push(ownerMember);
+    }
 
     this.setActiveOrganizationId(orgId);
     return newOrg;
   },
 
   /**
-   * Retrieves an organization by ID.
+   * Retrieves an organization by ID from Firestore.
+   * Throws PersistenceError on permission denial or backend failure (never falls back silently).
    */
-  async getOrganization(orgId: string): Promise<Organization | null> {
-    if (isFirebaseConfigured() && db) {
+  async getOrganization(
+    orgId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<Organization | null> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        const snap = await getDoc(doc(db, 'organizations', orgId));
-        if (snap.exists()) {
-          return snap.data() as Organization;
-        }
-      } catch {
-        // Fallback to local store
+        const snap = await getDoc(doc(fs, 'organizations', orgId));
+        return snap.exists() ? (snap.data() as Organization) : null;
+      } catch (err) {
+        throw mapFirestoreError(err, 'getOrganization', 'organizations');
       }
     }
-    return localOrganizations.find((o) => o.id === orgId) || null;
+    return unitTestOrganizations.find((o) => o.id === orgId) || null;
+  },
+
+  /**
+   * Updates organization metadata (name, tagline, website, logoUrl) in Firestore.
+   */
+  async updateOrganization(
+    orgId: string,
+    updates: Partial<Pick<Organization, 'name' | 'slug' | 'tagline' | 'logoUrl' | 'website'>>,
+    options?: FirestoreExecutionOptions
+  ): Promise<Organization> {
+    const now = new Date().toISOString();
+    const fs = resolveFirestore(options?.firestore);
+
+    if (fs) {
+      try {
+        const orgRef = doc(fs, 'organizations', orgId);
+        const existingSnap = await getDoc(orgRef);
+        if (!existingSnap.exists()) {
+          throw new PersistenceError({
+            code: 'NOT_FOUND',
+            message: `Organization "${orgId}" not found.`,
+            operation: 'updateOrganization',
+            collection: 'organizations',
+          });
+        }
+
+        const sanitized = sanitizeFirestoreData({
+          ...updates,
+          updatedAt: now,
+        });
+        await updateDoc(orgRef, withServerTimestamps(sanitized as Record<string, unknown>, false));
+        const updatedSnap = await getDoc(orgRef);
+        return updatedSnap.data() as Organization;
+      } catch (err) {
+        throw mapFirestoreError(err, 'updateOrganization', 'organizations');
+      }
+    }
+
+    const idx = unitTestOrganizations.findIndex((o) => o.id === orgId);
+    if (idx === -1) {
+      throw new PersistenceError({
+        code: 'NOT_FOUND',
+        message: `Organization "${orgId}" not found.`,
+        operation: 'updateOrganization',
+        collection: 'organizations',
+      });
+    }
+    const updated: Organization = { ...unitTestOrganizations[idx], ...updates, updatedAt: now };
+    unitTestOrganizations[idx] = updated;
+    return updated;
+  },
+
+  /**
+   * Persists organization settings (name + settings map) durably to Firestore.
+   */
+  async updateOrganizationSettings(
+    orgId: string,
+    params: {
+      name?: string;
+      settings: OrganizationSettings;
+      updatedBy: string;
+    },
+    options?: FirestoreExecutionOptions
+  ): Promise<Organization> {
+    const now = new Date().toISOString();
+    const nextSettings: OrganizationSettings = {
+      ...params.settings,
+      updatedBy: params.updatedBy,
+      updatedAt: now,
+    };
+
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      try {
+        const orgRef = doc(fs, 'organizations', orgId);
+        const existingSnap = await getDoc(orgRef);
+        if (!existingSnap.exists()) {
+          throw new PersistenceError({
+            code: 'NOT_FOUND',
+            message: `Organization "${orgId}" not found.`,
+            operation: 'updateOrganizationSettings',
+            collection: 'organizations',
+          });
+        }
+
+        const patch: Record<string, unknown> = {
+          settings: sanitizeFirestoreData(nextSettings),
+          updatedAt: now,
+        };
+        if (params.name && params.name.trim().length >= 2) {
+          patch.name = params.name.trim();
+        }
+
+        await updateDoc(orgRef, withServerTimestamps(patch, false));
+        const refreshed = await getDoc(orgRef);
+        return refreshed.data() as Organization;
+      } catch (err) {
+        throw mapFirestoreError(err, 'updateOrganizationSettings', 'organizations');
+      }
+    }
+
+    const idx = unitTestOrganizations.findIndex((o) => o.id === orgId);
+    if (idx === -1) {
+      throw new PersistenceError({
+        code: 'NOT_FOUND',
+        message: `Organization "${orgId}" not found.`,
+        operation: 'updateOrganizationSettings',
+        collection: 'organizations',
+      });
+    }
+    const updated: Organization = {
+      ...unitTestOrganizations[idx],
+      ...(params.name ? { name: params.name.trim() } : {}),
+      settings: nextSettings,
+      updatedAt: now,
+    };
+    unitTestOrganizations[idx] = updated;
+    return updated;
+  },
+
+  /**
+   * Atomically transfers organization ownership to an existing member inside a Firestore transaction.
+   */
+  async transferOwnership(
+    orgId: string,
+    currentOwnerId: string,
+    newOwnerId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<void> {
+    if (currentOwnerId === newOwnerId) return;
+    const now = new Date().toISOString();
+    const fs = resolveFirestore(options?.firestore);
+
+    if (fs) {
+      try {
+        await runTransaction(fs, async (tx) => {
+          const orgRef = doc(fs, 'organizations', orgId);
+          const currentOwnerMemberRef = doc(fs, 'organizations', orgId, 'members', currentOwnerId);
+          const newOwnerMemberRef = doc(fs, 'organizations', orgId, 'members', newOwnerId);
+
+          const [orgSnap, currentSnap, targetSnap] = await Promise.all([
+            tx.get(orgRef),
+            tx.get(currentOwnerMemberRef),
+            tx.get(newOwnerMemberRef),
+          ]);
+
+          if (!orgSnap.exists()) {
+            throw new PersistenceError({
+              code: 'NOT_FOUND',
+              message: `Organization "${orgId}" not found.`,
+              operation: 'transferOwnership',
+              collection: 'organizations',
+            });
+          }
+          if (!targetSnap.exists()) {
+            throw new PersistenceError({
+              code: 'NOT_FOUND',
+              message: `Target member "${newOwnerId}" must be a member of organization "${orgId}" before ownership transfer.`,
+              operation: 'transferOwnership',
+              collection: 'organizations/members',
+            });
+          }
+          if (!currentSnap.exists() || orgSnap.data().ownerId !== currentOwnerId) {
+            throw new PersistenceError({
+              code: 'PERMISSION_DENIED',
+              message: 'Only the current organization owner can transfer ownership.',
+              operation: 'transferOwnership',
+              collection: 'organizations',
+            });
+          }
+
+          tx.update(orgRef, withServerTimestamps({ ownerId: newOwnerId, updatedAt: now }, false));
+          tx.update(newOwnerMemberRef, withServerTimestamps({ role: 'OWNER' }, false));
+          tx.update(currentOwnerMemberRef, withServerTimestamps({ role: 'ADMIN' }, false));
+        });
+        return;
+      } catch (err) {
+        throw mapFirestoreError(err, 'transferOwnership', 'organizations');
+      }
+    }
+
+    const org = unitTestOrganizations.find((o) => o.id === orgId);
+    if (!org || org.ownerId !== currentOwnerId) {
+      throw new PersistenceError({
+        code: 'PERMISSION_DENIED',
+        message: 'Only the current organization owner can transfer ownership.',
+        operation: 'transferOwnership',
+        collection: 'organizations',
+      });
+    }
+    const targetMember = unitTestMembers.find((m) => m.orgId === orgId && m.userId === newOwnerId);
+    if (!targetMember) {
+      throw new PersistenceError({
+        code: 'NOT_FOUND',
+        message: `Target member "${newOwnerId}" not found.`,
+        operation: 'transferOwnership',
+        collection: 'organizations/members',
+      });
+    }
+    const prevMember = unitTestMembers.find((m) => m.orgId === orgId && m.userId === currentOwnerId);
+    org.ownerId = newOwnerId;
+    org.updatedAt = now;
+    targetMember.role = 'OWNER';
+    if (prevMember) prevMember.role = 'ADMIN';
+  },
+
+  /**
+   * Lists competitions associated with an organization using bounded cursor pagination.
+   */
+  async listAssociatedCompetitions(
+    orgId: string,
+    pagination?: PaginationOptions
+  ): Promise<PaginatedResult<Competition>> {
+    const pageSize = clampPageSize(pagination?.pageSize);
+    const fs = resolveFirestore(pagination?.firestore);
+
+    if (fs) {
+      try {
+        const constraints: QueryConstraint[] = [
+          where('organizationId', '==', orgId),
+          limit(pageSize + 1),
+        ];
+        if (pagination?.cursor) {
+          constraints.push(startAfter(pagination.cursor));
+        }
+        const snap = await getDocs(query(collection(fs, 'competitions'), ...constraints));
+        const hasMore = snap.docs.length > pageSize;
+        const pageDocs = hasMore ? snap.docs.slice(0, pageSize) : snap.docs;
+        return {
+          items: pageDocs.map((d) => d.data() as Competition),
+          hasMore,
+          nextCursor: hasMore ? pageDocs[pageDocs.length - 1] : null,
+          pageSize,
+        };
+      } catch (err) {
+        throw mapFirestoreError(err, 'listAssociatedCompetitions', 'competitions');
+      }
+    }
+
+    return { items: [], hasMore: false, nextCursor: null, pageSize };
+  },
+
+  /**
+   * Lists all authoritative organization memberships for a user across all tenants.
+   */
+  async getUserOrgMemberships(
+    userId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<Record<string, OrgRole>> {
+    const memberships: Record<string, OrgRole> = {};
+    const fs = resolveFirestore(options?.firestore);
+
+    if (fs) {
+      try {
+        const q = query(
+          collectionGroup(fs, 'members'),
+          where('userId', '==', userId),
+          limit(100)
+        );
+        const snap = await getDocs(q);
+        snap.forEach((docSnap) => {
+          const data = docSnap.data() as OrganizationMember;
+          const orgId = data.orgId || docSnap.ref.parent.parent?.id;
+          if (orgId && data.role) {
+            memberships[orgId] = data.role;
+          }
+        });
+        return memberships;
+      } catch (err) {
+        throw mapFirestoreError(err, 'getUserOrgMemberships', 'organizations/members');
+      }
+    }
+
+    for (const m of unitTestMembers) {
+      if (m.userId === userId) {
+        memberships[m.orgId] = m.role;
+      }
+    }
+    return memberships;
   },
 
   /**
    * Lists all organizations where a user is a registered member.
    */
-  async getUserOrganizations(userId: string): Promise<Organization[]> {
-    const matchingOrgIds = localMembers
-      .filter((m) => m.userId === userId)
-      .map((m) => m.orgId);
-    return localOrganizations.filter((o) => matchingOrgIds.includes(o.id) || o.ownerId === userId);
+  async getUserOrganizations(
+    userId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<Organization[]> {
+    const memberships = await this.getUserOrgMemberships(userId, options);
+    const orgIds = Object.keys(memberships);
+    if (orgIds.length === 0) return [];
+
+    const results = await Promise.all(orgIds.map((orgId) => this.getOrganization(orgId, options)));
+    const orgs: Organization[] = [];
+    for (const org of results) {
+      if (org && !orgs.some((o) => o.id === org.id)) {
+        orgs.push(org);
+      }
+    }
+    return orgs;
   },
 
   /**
-   * Adds or invites a member to an organization.
+   * Adds a member to an organization in Firestore. Throws PersistenceError on failure.
    */
   async addMember(
     orgId: string,
     userId: string,
     email: string,
     displayName: string,
-    role: OrgRole = 'MEMBER'
+    role: OrgRole = 'MEMBER',
+    options?: FirestoreExecutionOptions
   ): Promise<OrganizationMember> {
     const member: OrganizationMember = {
       userId,
@@ -241,87 +510,135 @@ export const organizationService = {
       joinedAt: new Date().toISOString(),
     };
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await setDoc(doc(db, 'organizations', orgId, 'members', userId), member);
-      } catch {
-        // Fallback to local store
+        await setDoc(
+          doc(fs, 'organizations', orgId, 'members', userId),
+          withServerTimestamps(sanitizeFirestoreData(member), true)
+        );
+        return member;
+      } catch (err) {
+        throw mapFirestoreError(err, 'addMember', 'organizations/members');
       }
     }
 
-    localMembers = localMembers.filter((m) => !(m.orgId === orgId && m.userId === userId));
-    localMembers.push(member);
-    saveOrgsToStorage();
+    unitTestMembers = unitTestMembers.filter((m) => !(m.orgId === orgId && m.userId === userId));
+    unitTestMembers.push(member);
     return member;
   },
 
   /**
-   * Updates an existing member's role within an organization.
+   * Updates an existing member's role within an organization in Firestore.
    */
-  async updateMemberRole(orgId: string, userId: string, newRole: OrgRole): Promise<void> {
-    if (isFirebaseConfigured() && db) {
+  async updateMemberRole(
+    orgId: string,
+    userId: string,
+    newRole: OrgRole,
+    options?: FirestoreExecutionOptions
+  ): Promise<void> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await updateDoc(doc(db, 'organizations', orgId, 'members', userId), {
-          role: newRole,
-        });
-      } catch {
-        // Fallback to local store
+        await updateDoc(
+          doc(fs, 'organizations', orgId, 'members', userId),
+          withServerTimestamps({ role: newRole }, false)
+        );
+        return;
+      } catch (err) {
+        throw mapFirestoreError(err, 'updateMemberRole', 'organizations/members');
       }
     }
 
-    const found = localMembers.find((m) => m.orgId === orgId && m.userId === userId);
+    const found = unitTestMembers.find((m) => m.orgId === orgId && m.userId === userId);
     if (found) {
       found.role = newRole;
-      saveOrgsToStorage();
     }
   },
 
   /**
-   * Removes a member from an organization.
+   * Removes a member from an organization in Firestore.
    */
-  async removeMember(orgId: string, userId: string): Promise<void> {
-    if (isFirebaseConfigured() && db) {
+  async removeMember(
+    orgId: string,
+    userId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<void> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await deleteDoc(doc(db, 'organizations', orgId, 'members', userId));
-      } catch {
-        // Fallback to local store
+        await deleteDoc(doc(fs, 'organizations', orgId, 'members', userId));
+        return;
+      } catch (err) {
+        throw mapFirestoreError(err, 'removeMember', 'organizations/members');
       }
     }
 
-    localMembers = localMembers.filter((m) => !(m.orgId === orgId && m.userId === userId));
-    saveOrgsToStorage();
+    unitTestMembers = unitTestMembers.filter((m) => !(m.orgId === orgId && m.userId === userId));
   },
 
   /**
-   * Lists all members of an organization.
+   * Lists organization members with bounded pagination.
    */
-  async listMembers(orgId: string): Promise<OrganizationMember[]> {
-    if (isFirebaseConfigured() && db) {
+  async listMembersPaginated(
+    orgId: string,
+    pagination?: PaginationOptions
+  ): Promise<PaginatedResult<OrganizationMember>> {
+    const pageSize = clampPageSize(pagination?.pageSize);
+    const fs = resolveFirestore(pagination?.firestore);
+
+    if (fs) {
       try {
-        const snap = await getDocs(collection(db, 'organizations', orgId, 'members'));
-        if (!snap.empty) {
-          return snap.docs.map((d) => d.data() as OrganizationMember);
+        const constraints: QueryConstraint[] = [limit(pageSize + 1)];
+        if (pagination?.cursor) {
+          constraints.push(startAfter(pagination.cursor));
         }
-      } catch {
-        // Fallback to local store
+        const snap = await getDocs(
+          query(collection(fs, 'organizations', orgId, 'members'), ...constraints)
+        );
+        const hasMore = snap.docs.length > pageSize;
+        const pageDocs = hasMore ? snap.docs.slice(0, pageSize) : snap.docs;
+        return {
+          items: pageDocs.map((d) => d.data() as OrganizationMember),
+          hasMore,
+          nextCursor: hasMore ? pageDocs[pageDocs.length - 1] : null,
+          pageSize,
+        };
+      } catch (err) {
+        throw mapFirestoreError(err, 'listMembersPaginated', 'organizations/members');
       }
     }
-    return localMembers.filter((m) => m.orgId === orgId);
+
+    const filtered = unitTestMembers.filter((m) => m.orgId === orgId);
+    return {
+      items: filtered.slice(0, pageSize),
+      hasMore: filtered.length > pageSize,
+      nextCursor: null,
+      pageSize,
+    };
   },
 
   /**
-   * Gets the active organization ID from persistent local storage or in-memory fallback.
+   * Lists members of an organization (bounded page).
+   */
+  async listMembers(
+    orgId: string,
+    options?: PaginationOptions
+  ): Promise<OrganizationMember[]> {
+    const page = await this.listMembersPaginated(orgId, options);
+    return page.items;
+  },
+
+  /**
+   * Harmless UI preference: remembers last selected workspace ID in browser storage.
    */
   getActiveOrganizationId(): string | null {
     if (typeof localStorage !== 'undefined') {
-      return localStorage.getItem(ACTIVE_ORG_STORAGE_KEY) || (localOrganizations[0]?.id ?? null);
+      return localStorage.getItem(ACTIVE_ORG_STORAGE_KEY) || (unitTestOrganizations[0]?.id ?? null);
     }
-    return memoryActiveOrgId || (localOrganizations[0]?.id ?? null);
+    return memoryActiveOrgId || (unitTestOrganizations[0]?.id ?? null);
   },
 
-  /**
-   * Sets and persists the active organization ID.
-   */
   setActiveOrganizationId(orgId: string): void {
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(ACTIVE_ORG_STORAGE_KEY, orgId);
@@ -329,11 +646,18 @@ export const organizationService = {
     memoryActiveOrgId = orgId;
   },
 
+  clearActiveOrganizationId(): void {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(ACTIVE_ORG_STORAGE_KEY);
+    }
+    memoryActiveOrgId = null;
+  },
+
   /**
-   * Reset in-memory state (useful for test isolation).
+   * Reset unit-test-only in-memory store.
    */
   resetInMemoryStore(orgs: Organization[] = [], members: OrganizationMember[] = []): void {
-    localOrganizations = [...orgs];
-    localMembers = [...members];
+    unitTestOrganizations = [...orgs];
+    unitTestMembers = [...members];
   },
 };

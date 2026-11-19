@@ -30,6 +30,7 @@ import { useProoflyAuth } from '../../context/ProoflyAuthContext';
 import { competitionService } from '../../services/competitionService';
 import { competitionLifecycleService } from '../../services/competitionLifecycleService';
 import { accessManagementService } from '../../services/accessManagementService';
+import { authorizationService } from '../../services/authorizationService';
 import type {
   Competition,
   CompetitionStatus,
@@ -40,7 +41,7 @@ import type {
 
 export const CompetitionListPage: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
-  const { activeOrganization, currentUser, canManageCurrentOrg, loading: authLoading } = useProoflyAuth();
+  const { activeOrganization, currentUser, verifiedSession, canManageCurrentOrg, loading: authLoading } = useProoflyAuth();
   const { success, error: toastError } = useToast();
 
   const [competitions, setCompetitions] = useState<Competition[]>([]);
@@ -105,13 +106,13 @@ export const CompetitionListPage: React.FC = () => {
     { id: 'all', label: 'All Competitions', count: competitions.length },
     {
       id: 'active',
-      label: 'Active',
-      count: competitions.filter((c) => c.status === 'ACTIVE').length,
+      label: 'Active & Open',
+      count: competitions.filter((c) => c.status === 'ACTIVE' || c.status === 'REGISTRATION_OPEN' || c.status === 'REGISTRATION_CLOSED').length,
     },
     {
       id: 'evaluation',
       label: 'In Evaluation',
-      count: competitions.filter((c) => c.status === 'EVALUATION' || c.status === 'RESULTS_REVIEW').length,
+      count: competitions.filter((c) => c.status === 'EVALUATION' || c.status === 'RESULTS_REVIEW' || c.status === 'SUBMISSIONS_CLOSED').length,
     },
     {
       id: 'draft',
@@ -126,8 +127,8 @@ export const CompetitionListPage: React.FC = () => {
   ];
 
   const filteredCompetitions = competitions.filter((comp) => {
-    if (activeTab === 'active' && comp.status !== 'ACTIVE') return false;
-    if (activeTab === 'evaluation' && comp.status !== 'EVALUATION' && comp.status !== 'RESULTS_REVIEW') return false;
+    if (activeTab === 'active' && comp.status !== 'ACTIVE' && comp.status !== 'REGISTRATION_OPEN' && comp.status !== 'REGISTRATION_CLOSED') return false;
+    if (activeTab === 'evaluation' && comp.status !== 'EVALUATION' && comp.status !== 'RESULTS_REVIEW' && comp.status !== 'SUBMISSIONS_CLOSED') return false;
     if (activeTab === 'draft' && comp.status !== 'DRAFT') return false;
     if (activeTab === 'archived' && comp.status !== 'ARCHIVED') return false;
     if (searchQuery.trim()) {
@@ -152,6 +153,11 @@ export const CompetitionListPage: React.FC = () => {
   // Phase 3 Lifecycle Transition Handler
   const handleTransition = async (comp: Competition, nextStatus: CompetitionStatus) => {
     try {
+      await authorizationService.assertAuthorized(verifiedSession, {
+        operation: 'COMPETITION_MANAGE',
+        organizationId: comp.organizationId,
+        competitionId: comp.id,
+      });
       await competitionService.transitionStatus(comp.id, nextStatus);
       success(
         `Lifecycle Updated: ${nextStatus}`,
@@ -167,12 +173,11 @@ export const CompetitionListPage: React.FC = () => {
     e.preventDefault();
     if (!activeOrganization || !currentUser) return;
 
-    if (!canManageCurrentOrg) {
-      toastError('Permission Denied', 'Only organization Owners or Admins can create competitions.');
-      return;
-    }
-
     try {
+      await authorizationService.assertAuthorized(verifiedSession, {
+        operation: 'COMPETITION_CREATE',
+        organizationId: activeOrganization.id,
+      });
       const created = await competitionService.createCompetition(
         activeOrganization.id,
         currentUser.uid,
@@ -182,7 +187,7 @@ export const CompetitionListPage: React.FC = () => {
           title: newTitle,
           tagline: newTagline,
           type: newType,
-          status: 'ACTIVE',
+          status: 'DRAFT',
           participationType: newParticipation,
           visibility: newVisibility,
           tracks: tracks.length > 0 ? tracks : ['Healthcare & Edge AI', 'Event Tech & Community Discovery'],
@@ -210,7 +215,7 @@ export const CompetitionListPage: React.FC = () => {
         // Fallback
       }
 
-      success('Competition Created & Active', `"${created.title}" is live! Access Code: ${created.publicAccessCode}`);
+      success('Competition Created as Draft', `"${created.title}" is saved in Draft mode. Open registration or launch when ready.`);
       setIsCreateModalOpen(false);
       setSearchParams({});
       // Reset form
@@ -224,6 +229,12 @@ export const CompetitionListPage: React.FC = () => {
 
   const getStatusBadge = (status: CompetitionStatus) => {
     switch (status) {
+      case 'DRAFT':
+        return <Badge variant="neutral" size="sm">Draft</Badge>;
+      case 'REGISTRATION_OPEN':
+        return <Badge variant="primary" size="sm" dot>Registration Open</Badge>;
+      case 'REGISTRATION_CLOSED':
+        return <Badge variant="warning" size="sm" dot>Registration Closed</Badge>;
       case 'ACTIVE':
         return <Badge variant="success" size="sm" dot>Active</Badge>;
       case 'EVALUATION':
@@ -411,12 +422,37 @@ export const CompetitionListPage: React.FC = () => {
                       {/* State Machine Transition Quick Actions */}
                       {canManageCurrentOrg && (
                         <>
-                          {comp.status === 'DRAFT' && allowedTransitions.includes('ACTIVE') && (
+                          {comp.status === 'DRAFT' && allowedTransitions.includes('REGISTRATION_OPEN') && (
+                            <Button
+                              variant="secondary"
+                              size="xs"
+                              leftIcon={<Play size={12} />}
+                              onClick={() => handleTransition(comp, 'REGISTRATION_OPEN')}
+                              title="Open Participant Registration"
+                            >
+                              Open Reg
+                            </Button>
+                          )}
+
+                          {comp.status === 'REGISTRATION_OPEN' && allowedTransitions.includes('REGISTRATION_CLOSED') && (
+                            <Button
+                              variant="secondary"
+                              size="xs"
+                              leftIcon={<Lock size={12} />}
+                              onClick={() => handleTransition(comp, 'REGISTRATION_CLOSED')}
+                              title="Close Participant Registration"
+                            >
+                              Close Reg
+                            </Button>
+                          )}
+
+                          {(comp.status === 'DRAFT' || comp.status === 'REGISTRATION_OPEN' || comp.status === 'REGISTRATION_CLOSED') && allowedTransitions.includes('ACTIVE') && (
                             <Button
                               variant="primary"
                               size="xs"
                               leftIcon={<Play size={12} />}
                               onClick={() => handleTransition(comp, 'ACTIVE')}
+                              title="Open Submissions & Activate"
                             >
                               Activate
                             </Button>

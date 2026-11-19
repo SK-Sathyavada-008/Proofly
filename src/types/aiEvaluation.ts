@@ -4,18 +4,43 @@
 // ─────────────────────────────────────────────
 
 import type { InferenceTelemetry } from '../services/aiLogicService';
+import type {
+  EvidenceReference,
+  NormalizedExtractionResult,
+  ExtractionStatus,
+} from '../services/extractors/types';
+
+export type { EvidenceReference, NormalizedExtractionResult, ExtractionStatus };
 
 /**
  * Strict evidence classification per hackathon guidelines.
  * Models must never invent evidence or claim uninspected files were analyzed.
  */
 export type EvidenceClassification =
+  // Official Phase 07 taxonomy:
+  | 'VERIFIED_EVIDENCE'
+  | 'CLAIM_ONLY'
+  | 'MISSING_EVIDENCE'
+  | 'INACCESSIBLE_EVIDENCE'
+  | 'UNCLEAR_EVIDENCE'
+  | 'NOT_INSPECTED'
+  // Backward-compatibility aliases:
   | 'EVIDENCE_VERIFIED'
   | 'FEATURE_CLAIMED_BUT_NOT_DEMONSTRATED'
   | 'FEATURE_DEMONSTRABLY_ABSENT'
   | 'EVIDENCE_UNAVAILABLE'
   | 'CONTENT_UNCLEAR'
   | 'TECHNICAL_BEHAVIOR_NOT_TESTED';
+
+/**
+ * Explicit evaluation outcome separating real AI from fallbacks and failures.
+ */
+export type EvaluationOutcome =
+  | 'AI_COMPLETED'
+  | 'DETERMINISTIC_FALLBACK'
+  | 'AI_FAILED'
+  | 'EXTRACTION_INCOMPLETE'
+  | 'AWAITING_REVIEW';
 
 /**
  * Rubric criterion configured by organizers.
@@ -50,8 +75,13 @@ export interface ExtractedDocumentItem {
   mimeType: string;
   extractedText?: string;
   wordCount: number;
-  extractionStatus: 'EXTRACTED' | 'UNSUPPORTED_BINARY' | 'INACCESSIBLE' | 'EMPTY';
+  extractionStatus: ExtractionStatus;
   notes?: string;
+  evidenceReferences?: EvidenceReference[];
+  contentHash?: string;
+  normalizedResult?: NormalizedExtractionResult;
+  pageCount?: number;
+  slideCount?: number;
 }
 
 /**
@@ -75,18 +105,28 @@ export interface StructuredEvidencePacket {
     readmeContent?: string;
     starsCount?: number;
     inaccessibleReason?: string;
+    commitSha?: string;
+    branch?: string;
+    inspectedFiles?: string[];
   };
   deploymentMetadata?: {
     url: string;
     accessible: boolean;
     inaccessibleReason?: string;
+    httpStatus?: number;
+    responseTimeMs?: number;
+    reachabilityChecked?: boolean;
+    disclaimer?: string;
   };
   videoMetadata?: {
     url: string;
     platform: 'youtube' | 'vimeo' | 'loom' | 'direct' | 'other';
     disclaimer: string;
+    inspected?: boolean;
   };
   documentContents: ExtractedDocumentItem[];
+  allEvidenceReferences?: EvidenceReference[];
+  normalizedExtractions?: NormalizedExtractionResult[];
   evidenceDisclaimers: string[];
   assembledAt: string;
 }
@@ -100,13 +140,17 @@ export interface CriterionEvaluationResult {
   suggestedScore: number;
   maxScore: number;
   weight: number;
+  explanation?: string;
   positiveObservations: string[];
   evidenceReferences: string[];
   weaknesses: string[];
   exactDeductionExplanations: string[];
   missingEvidence: string[];
+  uncertainty?: string;
   confidence: 'HIGH' | 'MEDIUM' | 'LOW';
+  confidenceJustification?: string;
   limitations: string[];
+  questionsForJudge?: string[];
   evidenceClassifications: {
     claim: string;
     classification: EvidenceClassification;
@@ -145,23 +189,105 @@ export interface AiEvaluationReport {
   rawResponseText?: string;
   evaluatedAt: string;
   isImmutable: boolean;
+  evaluationOutcome?: EvaluationOutcome;
+  requestId?: string;
+  disclosures?: string[];
+}
+
+/**
+ * Canonical evaluation job lifecycle states per Phase 05 specification.
+ */
+export type EvaluationJobStatus =
+  | 'QUEUED'
+  | 'CLAIMED'
+  | 'EXTRACTING'
+  | 'EVALUATING'
+  | 'VALIDATING'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'RETRY_WAIT'
+  | 'CANCELLED'
+  // Backward-compatibility aliases
+  | 'LEASED'
+  | 'IN_PROGRESS';
+
+/**
+ * Supported evaluation job types.
+ */
+export type EvaluationJobType =
+  | 'EVALUATION'
+  | 'VERIFICATION'
+  | 'RE_EVALUATION'
+  | 'STAGE_EXTRACTION'
+  | 'STAGE_VALIDATION';
+
+/**
+ * Structured error classification for evaluation failures.
+ * Distinguishes retryable transient failures from fatal permanent issues.
+ */
+export type EvaluationJobErrorClassification =
+  | 'NETWORK_TRANSIENT'
+  | 'RATE_LIMIT'
+  | 'INVALID_INPUT'
+  | 'PERMISSION_ERROR'
+  | 'MODEL_ERROR'
+  | 'UNSUPPORTED_ARTIFACT'
+  | 'PERMANENT_FAILURE';
+
+/**
+ * Audit trail entry for evaluation job retries with backoff.
+ */
+export interface EvaluationJobRetryEntry {
+  attempt: number;
+  workerId: string;
+  errorClassification: EvaluationJobErrorClassification;
+  error: string;
+  timestamp: string;
+  backoffMs: number;
+}
+
+/**
+ * Determines whether a classified evaluation error is eligible for retry with backoff.
+ */
+export function isEvaluationErrorRetryable(
+  classification?: EvaluationJobErrorClassification | null
+): boolean {
+  if (!classification) return false;
+  return (
+    classification === 'NETWORK_TRANSIENT' ||
+    classification === 'RATE_LIMIT' ||
+    classification === 'MODEL_ERROR'
+  );
 }
 
 /**
  * Concurrency-safe Evaluation Job for the background queue.
+ * Stored in Firestore `/evaluationJobs/{jobId}` with server timestamps.
  */
 export interface AiEvaluationJob {
   id: string;
   submissionId: string;
   referenceId: string;
   competitionId: string;
-  status: 'QUEUED' | 'LEASED' | 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
-  leaseOwnerId?: string;
-  leaseExpiresAt?: string;
-  attempts: number;
+  organizationId: string;
+  rubricVersion: number;
+  jobType: EvaluationJobType;
+  status: EvaluationJobStatus;
+  attemptCount: number;
   maxAttempts: number;
-  lastError?: string;
-  reportId?: string;
   createdAt: string;
   updatedAt: string;
+  leaseExpiresAt?: string | null;
+  leaseOwnerId?: string | null;
+  errorClassification?: EvaluationJobErrorClassification | null;
+  errorDetails?: string | null;
+  resultReportId?: string | null;
+  idempotencyKey: string;
+  backoffUntilMs?: number;
+  retryHistory?: EvaluationJobRetryEntry[];
+
+  // Backward-compatibility aliases
+  attempts: number;
+  lastError?: string;
+  reportId?: string;
 }

@@ -1,19 +1,34 @@
 // ─────────────────────────────────────────────
-// competitionService.ts — Competition Configuration & Lifecycle Management
+// competitionService.ts — Durable Firestore Competition Configuration & Lifecycle
+// Proofly Phase 04 — Atomic Batches, Bounded Pagination, Zero Silent Fallbacks
 // ─────────────────────────────────────────────
 
 import {
   collection,
+  collectionGroup,
+  deleteDoc,
   doc,
   getDoc,
   getDocs,
-  setDoc,
-  updateDoc,
+  limit,
   query,
+  setDoc,
+  startAfter,
+  updateDoc,
   where,
+  writeBatch,
+  type QueryConstraint,
 } from 'firebase/firestore';
-import { db, isFirebaseConfigured } from '../config/firebase';
 import { sanitizeFirestoreData } from '../utils/firestoreUtils';
+import {
+  clampPageSize,
+  mapFirestoreError,
+  resolveFirestore,
+  withServerTimestamps,
+  type FirestoreExecutionOptions,
+  type PaginatedResult,
+  type PaginationOptions,
+} from './firestorePersistenceService';
 import type {
   Competition,
   CompetitionStatus,
@@ -23,10 +38,6 @@ import type {
   RubricCriterion,
 } from '../types/authAndCompetition';
 import { competitionLifecycleService } from './competitionLifecycleService';
-import { purgeLegacySampleStorageOnce } from '../utils/cleanSampleStorage';
-
-const COMPETITIONS_STORAGE_KEY = 'proofly_competitions_v1';
-const COMP_ROLES_STORAGE_KEY = 'proofly_competition_roles_v1';
 
 const DEFAULT_POLICIES: CompetitionPolicies = {
   teamSubmissionsEnabled: true,
@@ -72,56 +83,24 @@ const DEFAULT_RUBRIC: RubricCriterion[] = [
   },
 ];
 
+// Unit-test-only arrays (unused whenever Firestore is active)
 let localCompetitions: Competition[] = [];
 let localCompetitionRoles: CompetitionMemberAssignment[] = [];
 
-function loadCompetitionsFromStorage(): void {
-  purgeLegacySampleStorageOnce();
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    const rawComps = window.localStorage.getItem(COMPETITIONS_STORAGE_KEY);
-    if (rawComps) {
-      const parsed = JSON.parse(rawComps);
-      if (Array.isArray(parsed)) {
-        localCompetitions = parsed;
-      }
-    }
-    const rawRoles = window.localStorage.getItem(COMP_ROLES_STORAGE_KEY);
-    if (rawRoles) {
-      const parsed = JSON.parse(rawRoles);
-      if (Array.isArray(parsed)) {
-        localCompetitionRoles = parsed;
-      }
-    }
-  } catch {
-    // Ignore storage errors
-  }
-}
-
-function saveCompetitionsToStorage(): void {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    window.localStorage.setItem(COMPETITIONS_STORAGE_KEY, JSON.stringify(localCompetitions));
-    window.localStorage.setItem(COMP_ROLES_STORAGE_KEY, JSON.stringify(localCompetitionRoles));
-  } catch {
-    // Ignore storage errors
-  }
-}
-
-loadCompetitionsFromStorage();
-
 export const competitionService = {
   /**
-   * Creates a new competition in DRAFT status tied to an organization.
+   * Atomically creates a competition + creator COMPETITION_ADMIN role in Firestore.
+   * Throws PersistenceError if Firestore write fails (never falls back silently).
    */
   async createCompetition(
     orgId: string,
     creatorId: string,
     creatorEmail: string,
     creatorName: string,
-    input: Partial<Competition>
+    input: Partial<Competition>,
+    options?: FirestoreExecutionOptions & { userId?: string; callerRole?: string; reason?: string }
   ): Promise<Competition> {
-    const compId = `comp-${Math.random().toString(36).substring(2, 9)}`;
+    const compId = input.id || `comp-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 8)}`;
     const title = input.title?.trim() || 'Untitled Competition';
     const slug =
       input.slug ||
@@ -132,7 +111,8 @@ export const competitionService = {
         .replace(/^-+|-+$/g, '');
 
     const now = new Date().toISOString();
-    const accessCode = `PF-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+    const accessCode =
+      input.publicAccessCode || `PF-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
 
     const newComp: Competition = {
       id: compId,
@@ -142,7 +122,7 @@ export const competitionService = {
       tagline: input.tagline || '',
       description: input.description || '',
       type: input.type || 'HACKATHON',
-      status: input.status || 'ACTIVE',
+      status: input.status || 'DRAFT', // Phase 08: All new competitions default to DRAFT
       visibility: input.visibility || 'PUBLIC',
       participationType: input.participationType || 'BOTH',
       startDate: input.startDate || now,
@@ -177,6 +157,16 @@ export const competitionService = {
       openTrackDescription:
         input.openTrackDescription ||
         'Open Track: General innovation, cross-domain applications, and open-ended technical ideas with zero domain-relevance penalties.',
+      lifecycleHistory: [
+        {
+          from: 'DRAFT',
+          to: 'DRAFT',
+          changedAt: now,
+          changedBy: creatorId || options?.userId || 'system',
+          reason: 'Initial competition creation in DRAFT state',
+        },
+      ],
+      submissionCount: 0,
       createdAt: now,
       updatedAt: now,
     };
@@ -190,150 +180,228 @@ export const competitionService = {
       assignedAt: now,
     };
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await setDoc(doc(db, 'competitions', compId), sanitizeFirestoreData(newComp));
-        await setDoc(doc(db, 'competitions', compId, 'roles', creatorId), sanitizeFirestoreData(creatorAssignment));
-      } catch {
-        // Fallback to local store when Firestore rules reject unauthenticated writes
+        const compRef = doc(fs, 'competitions', compId);
+        const roleRef = doc(fs, 'competitions', compId, 'roles', creatorId);
+        // Write competition first (firestore.rules checks competitionExists on roles create)
+        await setDoc(
+          compRef,
+          withServerTimestamps(sanitizeFirestoreData(newComp), true)
+        );
+        const batch = writeBatch(fs);
+        batch.set(
+          roleRef,
+          withServerTimestamps(
+            sanitizeFirestoreData(creatorAssignment),
+            true
+          )
+        );
+        await batch.commit();
+        return newComp;
+      } catch (err) {
+        throw mapFirestoreError(err, 'createCompetition', 'competitions');
       }
     }
 
     localCompetitions.push(newComp);
     localCompetitionRoles.push(creatorAssignment);
-    saveCompetitionsToStorage();
-
     return newComp;
   },
 
-  /**
-   * Retrieves a competition by ID.
-   */
-  async getCompetition(compId: string): Promise<Competition | null> {
-    if (isFirebaseConfigured() && db) {
+  async getCompetition(
+    compId: string,
+    options?: FirestoreExecutionOptions & { userId?: string; callerRole?: string; reason?: string }
+  ): Promise<Competition | null> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        const snap = await getDoc(doc(db, 'competitions', compId));
-        if (snap.exists()) {
-          return snap.data() as Competition;
-        }
-      } catch {
-        // Fallback to local store
+        const snap = await getDoc(doc(fs, 'competitions', compId));
+        return snap.exists() ? (snap.data() as Competition) : null;
+      } catch (err) {
+        throw mapFirestoreError(err, 'getCompetition', 'competitions');
       }
     }
     return localCompetitions.find((c) => c.id === compId) || null;
   },
 
-  /**
-   * Retrieves a competition by public access code (used for participant zero-account submissions).
-   */
-  async getCompetitionByAccessCode(code: string): Promise<Competition | null> {
+  getCompetitionSync(compId: string): Competition | null {
+    return localCompetitions.find((c) => c.id === compId) || null;
+  },
+
+  async getCompetitionByAccessCode(
+    code: string,
+    options?: FirestoreExecutionOptions & { userId?: string; callerRole?: string; reason?: string }
+  ): Promise<Competition | null> {
     const upperCode = (code || '').trim().toUpperCase();
     if (!upperCode) return null;
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        const q = query(collection(db, 'competitions'), where('publicAccessCode', '==', upperCode));
+        const q = query(
+          collection(fs, 'competitions'),
+          where('publicAccessCode', '==', upperCode),
+          limit(1)
+        );
         const snap = await getDocs(q);
-        if (!snap.empty) {
-          return snap.docs[0].data() as Competition;
-        }
-      } catch {
-        // Fallback to local store
+        return snap.empty ? null : (snap.docs[0].data() as Competition);
+      } catch (err) {
+        throw mapFirestoreError(err, 'getCompetitionByAccessCode', 'competitions');
       }
     }
+
     return (
       localCompetitions.find((c) => (c.publicAccessCode || '').trim().toUpperCase() === upperCode) ||
       null
     );
   },
 
-  /**
-   * Lists all competitions across all organizations or the current environment.
-   */
-  async listAllCompetitions(): Promise<Competition[]> {
-    const list: Competition[] = [...localCompetitions];
-    if (isFirebaseConfigured() && db) {
+  async listAllCompetitionsPaginated(
+    pagination?: PaginationOptions
+  ): Promise<PaginatedResult<Competition>> {
+    const pageSize = clampPageSize(pagination?.pageSize);
+    const fs = resolveFirestore(pagination?.firestore);
+    if (fs) {
       try {
-        const q = collection(db, 'competitions');
-        const snap = await getDocs(q);
-        snap.forEach((docSnap) => {
-          const comp = docSnap.data() as Competition;
-          const idx = list.findIndex((c) => c.id === comp.id);
-          if (idx >= 0) {
-            list[idx] = comp;
-          } else {
-            list.push(comp);
-          }
-        });
-      } catch {
-        // Fallback to local store
+        const constraints: QueryConstraint[] = [limit(pageSize + 1)];
+        if (pagination?.cursor) {
+          constraints.push(startAfter(pagination.cursor));
+        }
+        const snap = await getDocs(query(collection(fs, 'competitions'), ...constraints));
+        const hasMore = snap.docs.length > pageSize;
+        const pageDocs = hasMore ? snap.docs.slice(0, pageSize) : snap.docs;
+        return {
+          items: pageDocs.map((d) => d.data() as Competition),
+          hasMore,
+          nextCursor: hasMore ? pageDocs[pageDocs.length - 1] : null,
+          pageSize,
+        };
+      } catch (err) {
+        throw mapFirestoreError(err, 'listAllCompetitionsPaginated', 'competitions');
       }
     }
-    return list;
+
+    return {
+      items: localCompetitions.slice(0, pageSize),
+      hasMore: localCompetitions.length > pageSize,
+      nextCursor: null,
+      pageSize,
+    };
   },
 
-  /**
-   * Lists competitions belonging to a specific organization.
-   */
-  async listOrganizationCompetitions(orgId: string): Promise<Competition[]> {
-    const list: Competition[] = localCompetitions.filter((c) => c.organizationId === orgId);
-    if (isFirebaseConfigured() && db) {
+  async listAllCompetitions(options?: PaginationOptions): Promise<Competition[]> {
+    const page = await this.listAllCompetitionsPaginated(options);
+    return page.items;
+  },
+
+  async listOrganizationCompetitionsPaginated(
+    orgId: string,
+    pagination?: PaginationOptions
+  ): Promise<PaginatedResult<Competition>> {
+    const pageSize = clampPageSize(pagination?.pageSize);
+    const fs = resolveFirestore(pagination?.firestore);
+    if (fs) {
       try {
-        const q = query(collection(db, 'competitions'), where('organizationId', '==', orgId));
-        const snap = await getDocs(q);
-        snap.forEach((docSnap) => {
-          const comp = docSnap.data() as Competition;
-          const idx = list.findIndex((c) => c.id === comp.id);
-          if (idx >= 0) {
-            list[idx] = comp;
-          } else {
-            list.push(comp);
-          }
-        });
-      } catch {
-        // Fallback to local store
+        const constraints: QueryConstraint[] = [
+          where('organizationId', '==', orgId),
+          limit(pageSize + 1),
+        ];
+        if (pagination?.cursor) {
+          constraints.push(startAfter(pagination.cursor));
+        }
+        const snap = await getDocs(query(collection(fs, 'competitions'), ...constraints));
+        const hasMore = snap.docs.length > pageSize;
+        const pageDocs = hasMore ? snap.docs.slice(0, pageSize) : snap.docs;
+        return {
+          items: pageDocs.map((d) => d.data() as Competition),
+          hasMore,
+          nextCursor: hasMore ? pageDocs[pageDocs.length - 1] : null,
+          pageSize,
+        };
+      } catch (err) {
+        throw mapFirestoreError(err, 'listOrganizationCompetitionsPaginated', 'competitions');
       }
     }
-    return list;
+
+    const filtered = localCompetitions.filter((c) => c.organizationId === orgId);
+    return {
+      items: filtered.slice(0, pageSize),
+      hasMore: filtered.length > pageSize,
+      nextCursor: null,
+      pageSize,
+    };
   },
 
-  /**
-   * Updates an existing competition with state transition validation.
-   */
-  async updateCompetition(compId: string, updates: Partial<Competition>): Promise<Competition> {
-    const existing = await this.getCompetition(compId);
+  async listOrganizationCompetitions(
+    orgId: string,
+    options?: PaginationOptions
+  ): Promise<Competition[]> {
+    const page = await this.listOrganizationCompetitionsPaginated(orgId, options);
+    return page.items;
+  },
+
+  async updateCompetition(
+    compId: string,
+    updates: Partial<Competition>,
+    options?: FirestoreExecutionOptions & { userId?: string; callerRole?: string; reason?: string }
+  ): Promise<Competition> {
+    const existing = await this.getCompetition(compId, options);
     if (!existing) {
       throw new Error(`Competition with id "${compId}" does not exist.`);
     }
 
-    // Lifecycle state transition validation
+    let updatedLifecycleHistory = existing.lifecycleHistory ? [...existing.lifecycleHistory] : [];
+
     if (updates.status && updates.status !== existing.status) {
-      const transitionCheck = competitionLifecycleService.isValidTransition(existing.status, updates.status);
+      if (options?.callerRole && !['COMPETITION_ADMIN', 'ORGANIZER', 'OWNER', 'ADMIN', 'SUPER_ADMIN'].includes(options.callerRole)) {
+        throw new Error(`Unauthorized: Role "${options.callerRole}" is not permitted to modify competition status.`);
+      }
+
+      const transitionCheck = competitionLifecycleService.isValidTransition(
+        existing.status,
+        updates.status
+      );
       if (!transitionCheck.valid) {
         throw new Error(transitionCheck.reason);
       }
 
-      // If activating, run full activation schema checks
-      if (updates.status === 'ACTIVE') {
+      if (updates.status === 'ACTIVE' || updates.status === 'REGISTRATION_OPEN') {
         const fullToActivate = { ...existing, ...updates } as Competition;
         const activationCheck = competitionLifecycleService.validateForActivation(fullToActivate);
         if (!activationCheck.valid) {
           throw new Error(`Cannot activate competition:\n- ${activationCheck.errors.join('\n- ')}`);
         }
       }
+
+      const nowIso = new Date().toISOString();
+      updatedLifecycleHistory.push({
+        from: existing.status,
+        to: updates.status,
+        changedAt: nowIso,
+        changedBy: options?.userId || 'system',
+        reason: (options as any)?.reason || `Lifecycle transition to ${updates.status}`,
+      });
     }
 
     const updated: Competition = {
       ...existing,
       ...updates,
+      lifecycleHistory: updatedLifecycleHistory,
       updatedAt: new Date().toISOString(),
     };
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await updateDoc(doc(db, 'competitions', compId), sanitizeFirestoreData(updated) as any);
-      } catch {
-        // Fallback to local store
+        await updateDoc(
+          doc(fs, 'competitions', compId),
+          withServerTimestamps(sanitizeFirestoreData(updated), false)
+        );
+        return updated;
+      } catch (err) {
+        throw mapFirestoreError(err, 'updateCompetition', 'competitions');
       }
     }
 
@@ -343,43 +411,44 @@ export const competitionService = {
     } else {
       localCompetitions.push(updated);
     }
-    saveCompetitionsToStorage();
-
     return updated;
   },
 
-  /**
-   * Transitions a competition to the target status with lifecycle validation.
-   */
-  async transitionStatus(compId: string, targetStatus: CompetitionStatus): Promise<Competition> {
-    return this.updateCompetition(compId, { status: targetStatus });
+  async transitionStatus(
+    compId: string,
+    targetStatus: CompetitionStatus,
+    options?: FirestoreExecutionOptions & { userId?: string; callerRole?: string; reason?: string }
+  ): Promise<Competition> {
+    return this.updateCompetition(compId, { status: targetStatus }, options);
   },
 
-  /**
-   * Transitions a competition to ARCHIVED status.
-   */
-  async archiveCompetition(compId: string): Promise<Competition> {
-    const existing = await this.getCompetition(compId);
+  async archiveCompetition(
+    compId: string,
+    options?: FirestoreExecutionOptions & { userId?: string; callerRole?: string; reason?: string }
+  ): Promise<Competition> {
+    const existing = await this.getCompetition(compId, options);
     if (!existing) {
       throw new Error(`Competition with id "${compId}" not found.`);
     }
 
-    return this.updateCompetition(compId, {
-      status: 'ARCHIVED',
-      archivedAt: new Date().toISOString(),
-    });
+    return this.updateCompetition(
+      compId,
+      {
+        status: 'ARCHIVED',
+        archivedAt: new Date().toISOString(),
+      },
+      options
+    );
   },
 
-  /**
-   * Assigns a role to a user within a competition (e.g. JUDGE or ORGANIZER).
-   */
   async assignCompetitionRole(
     compId: string,
     userId: string,
     email: string,
     displayName: string,
     role: CompetitionRole,
-    assignedTracks?: string[]
+    assignedTracks?: string[],
+    options?: FirestoreExecutionOptions & { userId?: string; callerRole?: string; reason?: string }
   ): Promise<CompetitionMemberAssignment> {
     const assignment: CompetitionMemberAssignment = {
       competitionId: compId,
@@ -391,11 +460,16 @@ export const competitionService = {
       assignedAt: new Date().toISOString(),
     };
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await setDoc(doc(db, 'competitions', compId, 'roles', userId), assignment);
-      } catch {
-        // Fallback to local store
+        await setDoc(
+          doc(fs, 'competitions', compId, 'roles', userId),
+          withServerTimestamps(sanitizeFirestoreData(assignment), true)
+        );
+        return assignment;
+      } catch (err) {
+        throw mapFirestoreError(err, 'assignCompetitionRole', 'competitions/roles');
       }
     }
 
@@ -403,30 +477,73 @@ export const competitionService = {
       (r) => !(r.competitionId === compId && r.userId === userId)
     );
     localCompetitionRoles.push(assignment);
-    saveCompetitionsToStorage();
     return assignment;
   },
 
-  /**
-   * Retrieves all assigned members and judges for a competition.
-   */
-  async listCompetitionRoles(compId: string): Promise<CompetitionMemberAssignment[]> {
-    if (isFirebaseConfigured() && db) {
+  async listCompetitionRoles(
+    compId: string,
+    options?: PaginationOptions
+  ): Promise<CompetitionMemberAssignment[]> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      const pageSize = clampPageSize(options?.pageSize);
       try {
-        const snap = await getDocs(collection(db, 'competitions', compId, 'roles'));
-        if (!snap.empty) {
-          return snap.docs.map((d) => d.data() as CompetitionMemberAssignment);
-        }
-      } catch {
-        // Fallback to local store
+        const snap = await getDocs(
+          query(collection(fs, 'competitions', compId, 'roles'), limit(pageSize))
+        );
+        return snap.docs.map((d) => d.data() as CompetitionMemberAssignment);
+      } catch (err) {
+        throw mapFirestoreError(err, 'listCompetitionRoles', 'competitions/roles');
       }
     }
     return localCompetitionRoles.filter((r) => r.competitionId === compId);
   },
 
-  /**
-   * Reset in-memory competitions store (for test isolation).
-   */
+  async listUserCompetitionRoles(
+    userId: string,
+    options?: FirestoreExecutionOptions & { userId?: string; callerRole?: string; reason?: string }
+  ): Promise<CompetitionMemberAssignment[]> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      try {
+        const q = query(collectionGroup(fs, 'roles'), where('userId', '==', userId), limit(100));
+        const snap = await getDocs(q);
+        const byComp = new Map<string, CompetitionMemberAssignment>();
+        snap.forEach((docSnap) => {
+          const data = docSnap.data() as CompetitionMemberAssignment;
+          const compId = data.competitionId || docSnap.ref.parent.parent?.id;
+          if (compId && data.role) {
+            byComp.set(compId, { ...data, competitionId: compId });
+          }
+        });
+        return Array.from(byComp.values());
+      } catch (err) {
+        throw mapFirestoreError(err, 'listUserCompetitionRoles', 'competitions/roles');
+      }
+    }
+
+    return localCompetitionRoles.filter((r) => r.userId === userId);
+  },
+
+  async removeCompetitionRole(
+    compId: string,
+    userId: string,
+    options?: FirestoreExecutionOptions & { userId?: string; callerRole?: string; reason?: string }
+  ): Promise<void> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      try {
+        await deleteDoc(doc(fs, 'competitions', compId, 'roles', userId));
+        return;
+      } catch (err) {
+        throw mapFirestoreError(err, 'removeCompetitionRole', 'competitions/roles');
+      }
+    }
+    localCompetitionRoles = localCompetitionRoles.filter(
+      (r) => !(r.competitionId === compId && r.userId === userId)
+    );
+  },
+
   resetInMemoryStore(comps: Competition[] = [], roles: CompetitionMemberAssignment[] = []): void {
     localCompetitions = [...comps];
     localCompetitionRoles = [...roles];

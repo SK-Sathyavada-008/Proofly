@@ -3,9 +3,25 @@
 // Proofly / Evalora — Phase 6
 // ─────────────────────────────────────────────
 
-import { db, isFirebaseConfigured } from '../config/firebase';
-import { collection, doc, setDoc, getDoc, getDocs, query, where } from 'firebase/firestore';
+import {
+  collection,
+  doc,
+  setDoc,
+  getDoc,
+  getDocs,
+  limit,
+  query,
+  where,
+} from 'firebase/firestore';
 import { sanitizeFirestoreData } from '../utils/firestoreUtils';
+import {
+  clampPageSize,
+  mapFirestoreError,
+  resolveFirestore,
+  withServerTimestamps,
+  type FirestoreExecutionOptions,
+  type PaginationOptions,
+} from './firestorePersistenceService';
 import type { ProjectSubmission } from '../types/submission';
 import type { Competition } from '../types/authAndCompetition';
 import type {
@@ -247,47 +263,69 @@ export class EvaluationPipelineService {
   /**
    * Saves an AI Evaluation Report to memory and Firestore.
    */
-  public async saveEvaluationReport(report: AiEvaluationReport): Promise<void> {
-    this.memReports.set(report.id, report);
-    this.memReports.set(`sub_${report.submissionId}`, report);
-
-    if (isFirebaseConfigured() && db) {
+  public async saveEvaluationReport(
+    report: AiEvaluationReport,
+    options?: FirestoreExecutionOptions
+  ): Promise<void> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await setDoc(doc(db, 'aiEvaluationReports', report.id), sanitizeFirestoreData(report));
+        await setDoc(
+          doc(fs, 'aiEvaluationReports', report.id),
+          withServerTimestamps(sanitizeFirestoreData(report), true)
+        );
+        return;
       } catch (err) {
-        console.warn('Could not save AI evaluation report to Firestore; preserved in memory.', err);
+        throw mapFirestoreError(err, 'saveEvaluationReport', 'aiEvaluationReports');
       }
     }
+
+    this.memReports.set(report.id, report);
+    this.memReports.set(`sub_${report.submissionId}`, report);
   }
 
   /**
    * Retrieves an AI Evaluation Report by report ID.
    */
-  public async getEvaluationReport(reportId: string): Promise<AiEvaluationReport | null> {
-    if (this.memReports.has(reportId)) {
-      return this.memReports.get(reportId)!;
-    }
-
-    if (isFirebaseConfigured() && db) {
+  public async getEvaluationReport(
+    reportId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<AiEvaluationReport | null> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        const snap = await getDoc(doc(db, 'aiEvaluationReports', reportId));
-        if (snap.exists()) {
-          const loaded = snap.data() as AiEvaluationReport;
-          this.memReports.set(reportId, loaded);
-          return loaded;
-        }
-      } catch {
-        // fallback
+        const snap = await getDoc(doc(fs, 'aiEvaluationReports', reportId));
+        return snap.exists() ? (snap.data() as AiEvaluationReport) : null;
+      } catch (err) {
+        throw mapFirestoreError(err, 'getEvaluationReport', 'aiEvaluationReports');
       }
     }
 
-    return null;
+    return this.memReports.get(reportId) || null;
   }
 
   /**
    * Retrieves an AI Evaluation Report for a given submission ID.
    */
-  public async getReportBySubmissionId(submissionId: string): Promise<AiEvaluationReport | null> {
+  public async getReportBySubmissionId(
+    submissionId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<AiEvaluationReport | null> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      try {
+        const q = query(
+          collection(fs, 'aiEvaluationReports'),
+          where('submissionId', '==', submissionId),
+          limit(1)
+        );
+        const snaps = await getDocs(q);
+        return snaps.empty ? null : (snaps.docs[0].data() as AiEvaluationReport);
+      } catch (err) {
+        console.warn('getReportBySubmissionId failed in Firestore, checking fallback:', err);
+      }
+    }
+
     const memoryKey = `sub_${submissionId}`;
     if (this.memReports.has(memoryKey)) {
       return this.memReports.get(memoryKey)!;
@@ -299,57 +337,38 @@ export class EvaluationPipelineService {
       }
     }
 
-    if (isFirebaseConfigured() && db) {
-      try {
-        const q = query(
-          collection(db, 'aiEvaluationReports'),
-          where('submissionId', '==', submissionId)
-        );
-        const snaps = await getDocs(q);
-        if (!snaps.empty) {
-          const loaded = snaps.docs[0].data() as AiEvaluationReport;
-          this.memReports.set(loaded.id, loaded);
-          this.memReports.set(memoryKey, loaded);
-          return loaded;
-        }
-      } catch {
-        // fallback
-      }
-    }
-
     return null;
   }
 
   /**
-   * Lists all unique AI Evaluation Reports for a given competition.
+   * Lists all unique AI Evaluation Reports for a given competition (bounded via limit()).
    */
-  public async listReportsByCompetition(competitionId: string): Promise<AiEvaluationReport[]> {
-    const byId = new Map<string, AiEvaluationReport>();
+  public async listReportsByCompetition(
+    competitionId: string,
+    options?: PaginationOptions
+  ): Promise<AiEvaluationReport[]> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      const pageSize = clampPageSize(options?.pageSize);
+      try {
+        const q = query(
+          collection(fs, 'aiEvaluationReports'),
+          where('competitionId', '==', competitionId),
+          limit(pageSize)
+        );
+        const snaps = await getDocs(q);
+        return snaps.docs.map((d) => d.data() as AiEvaluationReport);
+      } catch (err) {
+        throw mapFirestoreError(err, 'listReportsByCompetition', 'aiEvaluationReports');
+      }
+    }
 
+    const byId = new Map<string, AiEvaluationReport>();
     for (const report of this.memReports.values()) {
       if (report.competitionId === competitionId) {
         byId.set(report.id, report);
       }
     }
-
-    if (isFirebaseConfigured() && db) {
-      try {
-        const q = query(
-          collection(db, 'aiEvaluationReports'),
-          where('competitionId', '==', competitionId)
-        );
-        const snaps = await getDocs(q);
-        snaps.forEach((d) => {
-          const loaded = d.data() as AiEvaluationReport;
-          byId.set(loaded.id, loaded);
-          this.memReports.set(loaded.id, loaded);
-          this.memReports.set(`sub_${loaded.submissionId}`, loaded);
-        });
-      } catch {
-        // fallback to memory
-      }
-    }
-
     return Array.from(byId.values());
   }
 

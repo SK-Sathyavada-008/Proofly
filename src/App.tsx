@@ -13,8 +13,12 @@ import { ParticipantLayout } from './layouts/ParticipantLayout';
 
 // Public Pages
 import { LandingHubPage } from './pages/LandingHubPage';
+import { AuthPage } from './pages/AuthPage';
 import AiLogicTestPage from './pages/AiLogicTestPage';
 import { PublicLeaderboardPage } from './pages/PublicLeaderboardPage';
+
+// Route Protection
+import { ProtectedRoute } from './components/auth/ProtectedRoute';
 
 // Organizer Pages
 import { OrganizerOverviewPage } from './pages/organizer/OrganizerOverviewPage';
@@ -43,11 +47,24 @@ export default function App() {
         {/* Public Landing & Product Entry Hub */}
         <Route path="/" element={<LandingHubPage />} />
 
+        {/* Firebase Authentication & Invitation Onboarding */}
+        <Route path="/auth" element={<AuthPage />} />
+        <Route path="/login" element={<AuthPage initialMode="signin" />} />
+        <Route path="/signup" element={<AuthPage initialMode="signup" />} />
+        <Route path="/reset-password" element={<AuthPage initialMode="reset" />} />
+
         {/* Phase 1: Firebase AI Logic Hybrid Inference Spike */}
         <Route path="/ai-test" element={<AiLogicTestPage />} />
 
-        {/* ── 1. ORGANIZER COMMAND CENTER ── */}
-        <Route path="/organizer" element={<OrganizerLayout />}>
+        {/* ── 1. ORGANIZER COMMAND CENTER (Protected: Organizer/Admin/Viewer Scope) ── */}
+        <Route
+          path="/organizer"
+          element={
+            <ProtectedRoute requiredWorkspace="organizer">
+              <OrganizerLayout />
+            </ProtectedRoute>
+          }
+        >
           <Route index element={<OrganizerOverviewPage />} />
           <Route path="overview" element={<OrganizerOverviewPage />} />
           <Route path="competitions" element={<CompetitionListPage />} />
@@ -60,8 +77,15 @@ export default function App() {
           <Route path="*" element={<Navigate to="/organizer" replace />} />
         </Route>
 
-        {/* ── 2. JUDGE WORKSPACE ── */}
-        <Route path="/judge" element={<JudgeLayout />}>
+        {/* ── 2. JUDGE WORKSPACE (Protected: Authorized Judge/Organizer Scope) ── */}
+        <Route
+          path="/judge"
+          element={
+            <ProtectedRoute requiredWorkspace="judge">
+              <JudgeLayout />
+            </ProtectedRoute>
+          }
+        >
           <Route index element={<Navigate to="/judge/assignments" replace />} />
           <Route path="assignments" element={<JudgeAssignmentListPage />} />
           <Route path="review" element={<JudgeReviewWorkspacePage />} />

@@ -316,7 +316,8 @@ describe('Proofly Comprehensive Corner Cases & Resilience Suite', () => {
         primaryContactName: 'Solo Researcher',
         primaryContactEmail: 'solo@research.org',
         projectTitle: 'On-Device Edge Transformers',
-        projectDescription: 'Efficient on-device inference using quantized kernels.',
+        projectDescription: 'Efficient on-device inference using quantized kernels and fast attention.',
+        githubUrl: 'https://github.com/sk-sathyavada-008/edge-transformers',
         fieldValues: {},
       };
 
@@ -354,7 +355,8 @@ describe('Proofly Comprehensive Corner Cases & Resilience Suite', () => {
           { name: 'Specialist Dev', email: 'spec@quantum.org', role: 'ML Ops', isLead: false },
         ],
         projectTitle: 'Quantum Edge Kernel',
-        projectDescription: 'Sub-millisecond latency AI execution pipeline.',
+        projectDescription: 'Sub-millisecond latency AI execution pipeline with real-time acceleration.',
+        githubUrl: 'https://github.com/sk-sathyavada-008/quantum-edge',
         fieldValues: {},
       };
 
@@ -376,8 +378,10 @@ describe('Proofly Comprehensive Corner Cases & Resilience Suite', () => {
         sessionToken: sessionRes.session!.sessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'User A',
+        primaryContactEmail: 'usera@example.com',
         projectTitle: 'Project A',
-        projectDescription: 'Original description A',
+        projectDescription: 'Original description A with comprehensive system architecture and benchmarks.',
+        githubUrl: 'https://github.com/sk-sathyavada-008/project-a',
         fieldValues: {},
       }, baseCompetition);
 
@@ -386,8 +390,10 @@ describe('Proofly Comprehensive Corner Cases & Resilience Suite', () => {
         sessionToken: sessionRes.session!.sessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'User B',
+        primaryContactEmail: 'userb@example.com',
         projectTitle: 'Project B',
-        projectDescription: 'Original description B',
+        projectDescription: 'Original description B with comprehensive system architecture and benchmarks.',
+        githubUrl: 'https://github.com/sk-sathyavada-008/project-b',
         fieldValues: {},
       }, baseCompetition);
 
@@ -414,8 +420,10 @@ describe('Proofly Comprehensive Corner Cases & Resilience Suite', () => {
         sessionToken: sessionRes.session!.sessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'Evolving Dev',
+        primaryContactEmail: 'evolving@example.com',
         projectTitle: 'Version 1 Project',
-        projectDescription: 'Initial commit of project description.',
+        projectDescription: 'Initial commit of project description with comprehensive architecture benchmarks.',
+        githubUrl: 'https://github.com/sk-sathyavada-008/evolving-repo',
         fieldValues: {},
       }, baseCompetition);
 
@@ -427,7 +435,7 @@ describe('Proofly Comprehensive Corner Cases & Resilience Suite', () => {
         rawToken: created.rawManagementToken,
         updatedPayload: {
           projectTitle: 'Version 2 Project Refined',
-          projectDescription: 'Updated architecture and benchmarks.',
+          projectDescription: 'Updated architecture and benchmarks with extended empirical evaluation.',
         },
         changeSummary: 'Refined architecture benchmarks',
         mockCompetition: baseCompetition,
@@ -447,8 +455,10 @@ describe('Proofly Comprehensive Corner Cases & Resilience Suite', () => {
         sessionToken: sessionRes.session!.sessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'Lock Dev',
+        primaryContactEmail: 'lockdev@example.com',
         projectTitle: 'Pre-Lock Title',
-        projectDescription: 'Description before lock.',
+        projectDescription: 'Description before lock. Detailed architectural overview and system implementation for edge testing.',
+        githubUrl: 'https://github.com/sk-sathyavada-008/proofly',
         fieldValues: {},
       }, baseCompetition);
 
@@ -479,8 +489,10 @@ describe('Proofly Comprehensive Corner Cases & Resilience Suite', () => {
         sessionToken: sessionRes.session!.sessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'Gate Dev',
+        primaryContactEmail: 'gatedev@example.com',
         projectTitle: 'Gate Project',
-        projectDescription: 'Automated gate check verification.',
+        projectDescription: 'Automated gate check verification. Detailed architectural overview and system implementation for edge testing.',
+        githubUrl: 'https://github.com/sk-sathyavada-008/proofly',
         fieldValues: {},
       }, baseCompetition);
 

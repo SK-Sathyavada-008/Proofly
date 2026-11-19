@@ -16,6 +16,8 @@ export type CompetitionType =
 
 export type CompetitionStatus =
   | 'DRAFT'
+  | 'REGISTRATION_OPEN'
+  | 'REGISTRATION_CLOSED'
   | 'ACTIVE'
   | 'SUBMISSIONS_CLOSED'
   | 'EVALUATION'
@@ -37,6 +39,14 @@ export interface UserProfile {
   updatedAt: string;
 }
 
+export interface OrganizationSettings {
+  contactEmail?: string;
+  defaultAiMode?: 'PREFER_ON_DEVICE' | 'ONLY_ON_DEVICE' | 'PREFER_IN_CLOUD' | 'ONLY_IN_CLOUD';
+  appCheckEnforced?: boolean;
+  updatedBy?: string;
+  updatedAt?: string;
+}
+
 export interface Organization {
   id: string;
   name: string;
@@ -45,6 +55,7 @@ export interface Organization {
   logoUrl?: string;
   website?: string;
   ownerId: string;
+  settings?: OrganizationSettings;
   createdAt: string;
   updatedAt: string;
 }
@@ -69,17 +80,30 @@ export interface CompetitionRound {
   status: 'PENDING' | 'ACTIVE' | 'COMPLETED';
 }
 
+export interface CompetitionLifecycleEntry {
+  from: CompetitionStatus;
+  to: CompetitionStatus;
+  changedAt: string;
+  changedBy: string;
+  reason?: string;
+}
+
 export interface CompetitionPolicies {
   teamSubmissionsEnabled: boolean;
   minTeamMembers: number;
   maxTeamMembers: number;
   individualSubmissionsAllowed: boolean;
+  registrationDeadline?: string;
   submissionDeadline: string; // ISO string
   allowLateSubmissions: boolean;
+  lateSubmissionDeadline?: string;
   allowSubmissionEdits: boolean;
+  maxSubmissions?: number;
   aiEvaluationEnabled: boolean; // Mandatory for hackathon demo
   judgeFeedbackVisibleToParticipants: boolean;
   aiScoresVisibleToParticipants: boolean;
+  isLeaderboardHidden?: boolean;
+  leaderboardPublishDate?: string;
 }
 
 export interface RubricCriterion {
@@ -111,6 +135,8 @@ export interface Competition {
   tracks: string[];
   isOpenTrackEnabled?: boolean;
   openTrackDescription?: string;
+  lifecycleHistory?: CompetitionLifecycleEntry[];
+  submissionCount?: number;
   createdAt: string;
   updatedAt: string;
   archivedAt?: string;

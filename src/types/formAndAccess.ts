@@ -51,6 +51,7 @@ export interface SubmissionFormField {
 export interface SubmissionFormSchema {
   id: string;
   competitionId: string;
+  organizationId?: string;
   roundId?: string; // Optional: allows round-specific forms
   title: string;
   description?: string;

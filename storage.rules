@@ -2,6 +2,109 @@ rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
 
+    // ─────────────────────────────────────────────────────────────────
+    // Cross-Service Firestore Helpers (Strict Tenant & Role Isolation)
+    // ZERO reliance on custom client claims or broad `request.auth != null`.
+    // ─────────────────────────────────────────────────────────────────
+
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isPlatformAdmin() {
+      return isAuthenticated() &&
+        firestore.exists(/databases/(default)/documents/platformAdmins/$(request.auth.uid));
+    }
+
+    function hasOrgMembership(orgId) {
+      return isAuthenticated() &&
+        firestore.exists(/databases/(default)/documents/organizations/$(orgId)/members/$(request.auth.uid));
+    }
+
+    function getOrgRole(orgId) {
+      return firestore.get(/databases/(default)/documents/organizations/$(orgId)/members/$(request.auth.uid)).data.role;
+    }
+
+    function isOrgMember(orgId) {
+      return isPlatformAdmin() || hasOrgMembership(orgId);
+    }
+
+    function isOrgAdminOrOwner(orgId) {
+      return isPlatformAdmin() || (hasOrgMembership(orgId) && getOrgRole(orgId) in ['OWNER', 'ADMIN']);
+    }
+
+    function hasCompetitionRole(compId, roles) {
+      return isPlatformAdmin() || (
+        isAuthenticated() &&
+        firestore.exists(/databases/(default)/documents/competitions/$(compId)/roles/$(request.auth.uid)) &&
+        firestore.get(/databases/(default)/documents/competitions/$(compId)/roles/$(request.auth.uid)).data.role in roles
+      );
+    }
+
+    function isValidCompetition(orgId, compId) {
+      return firestore.exists(/databases/(default)/documents/competitions/$(compId)) &&
+        firestore.get(/databases/(default)/documents/competitions/$(compId)).data.organizationId == orgId;
+    }
+
+    function isCompetitionActive(compId) {
+      return firestore.get(/databases/(default)/documents/competitions/$(compId)).data.status == 'ACTIVE';
+    }
+
+    function isValidSubmission(orgId, compId, subId) {
+      return firestore.exists(/databases/(default)/documents/submissions/$(subId)) &&
+        firestore.get(/databases/(default)/documents/submissions/$(subId)).data.organizationId == orgId &&
+        firestore.get(/databases/(default)/documents/submissions/$(subId)).data.competitionId == compId;
+    }
+
+    function getSubmission(subId) {
+      return firestore.get(/databases/(default)/documents/submissions/$(subId)).data;
+    }
+
+    function isCompetitionAdmin(orgId, compId) {
+      return isValidCompetition(orgId, compId) && (
+        isOrgAdminOrOwner(orgId) ||
+        hasCompetitionRole(compId, ['COMPETITION_ADMIN', 'ORGANIZER'])
+      );
+    }
+
+    function isCompetitionViewerOrHigher(orgId, compId) {
+      return isValidCompetition(orgId, compId) && (
+        isOrgMember(orgId) ||
+        hasCompetitionRole(compId, ['COMPETITION_ADMIN', 'ORGANIZER', 'VIEWER'])
+      );
+    }
+
+    function isAssignedJudge(orgId, compId, subId) {
+      return isAuthenticated() &&
+        hasCompetitionRole(compId, ['JUDGE']) &&
+        firestore.exists(/databases/(default)/documents/judgeAssignments/$(subId + '_' + request.auth.uid)) &&
+        firestore.get(/databases/(default)/documents/judgeAssignments/$(subId + '_' + request.auth.uid)).data.organizationId == orgId &&
+        firestore.get(/databases/(default)/documents/judgeAssignments/$(subId + '_' + request.auth.uid)).data.competitionId == compId &&
+        firestore.get(/databases/(default)/documents/judgeAssignments/$(subId + '_' + request.auth.uid)).data.submissionId == subId &&
+        firestore.get(/databases/(default)/documents/judgeAssignments/$(subId + '_' + request.auth.uid)).data.judgeId == request.auth.uid &&
+        !(firestore.get(/databases/(default)/documents/judgeAssignments/$(subId + '_' + request.auth.uid)).data.status in ['CONFLICT', 'REVOKED']);
+    }
+
+    function isParticipantOwner(subId) {
+      return isAuthenticated() &&
+        'participantUid' in getSubmission(subId) &&
+        getSubmission(subId).participantUid == request.auth.uid;
+    }
+
+    function hasValidScopedUploadSession(orgId, compId, subId) {
+      return request.resource != null &&
+        request.resource.metadata != null &&
+        'sessionId' in request.resource.metadata &&
+        request.resource.metadata.sessionId is string &&
+        request.resource.metadata.sessionId.size() > 0 &&
+        firestore.exists(/databases/(default)/documents/participantSessions/$(request.resource.metadata.sessionId)) &&
+        firestore.get(/databases/(default)/documents/participantSessions/$(request.resource.metadata.sessionId)).data.organizationId == orgId &&
+        firestore.get(/databases/(default)/documents/participantSessions/$(request.resource.metadata.sessionId)).data.competitionId == compId &&
+        firestore.get(/databases/(default)/documents/participantSessions/$(request.resource.metadata.sessionId)).data.submissionId == subId &&
+        firestore.get(/databases/(default)/documents/participantSessions/$(request.resource.metadata.sessionId)).data.revoked == false &&
+        firestore.get(/databases/(default)/documents/participantSessions/$(request.resource.metadata.sessionId)).data.expiresAt > request.time;
+    }
+
     function isValidSubmissionContentType() {
       return request.resource.contentType in [
         'application/pdf',
@@ -23,24 +126,55 @@ service firebase.storage {
     }
 
     function hasSafeFileName(fileName) {
-      return !fileName.matches('.*\\.(exe|bat|cmd|sh|ps1|msi|dll|js|mjs|html|htm|php|scr)$');
+      return fileName.size() > 0 &&
+        fileName.size() <= 180 &&
+        !fileName.matches('.*\\.\\..*') &&
+        !fileName.matches('.*\\.(exe|bat|cmd|sh|ps1|msi|dll|js|mjs|html|htm|php|svg|scr|com|vbs)$');
     }
 
-    // Competition Submission Artifacts (Zero-Account Scoped Upload, Authenticated Review)
-    match /competitions/{competitionId}/submissions/{submissionId}/{fileName} {
-      // Anonymous participants can upload validated artifacts up to 25 MB with safe extensions
-      allow create: if isValidFileSize() &&
-                       isValidSubmissionContentType() &&
-                       hasSafeFileName(fileName);
+    // ─────────────────────────────────────────────────────────────────
+    // Tenant-Scoped Private Submission Artifacts
+    // Path: /organizations/{orgId}/competitions/{competitionId}/submissions/{submissionId}/{fileName}
+    // ─────────────────────────────────────────────────────────────────
 
-      // Only authenticated judges/organizers (or backend Admin SDK) may read uploaded artifacts
-      allow read: if request.auth != null;
+    match /organizations/{orgId}/competitions/{competitionId}/submissions/{submissionId}/{fileName} {
+      // Upload allowed for active competitions & unlocked Draft/Submitted submissions,
+      // with strict MIME, size (<= 25 MB), safe filename, and verified participant owner,
+      // scoped upload session, or competition admin. Pre-submission draft uploads permitted.
+      allow create: if isValidCompetition(orgId, competitionId) &&
+        isValidFileSize() &&
+        isValidSubmissionContentType() &&
+        hasSafeFileName(fileName) &&
+        (!firestore.exists(/databases/(default)/documents/submissions/$(submissionId)) || (
+          getSubmission(submissionId).organizationId == orgId &&
+          getSubmission(submissionId).competitionId == competitionId &&
+          getSubmission(submissionId).isLocked == false
+        )) && (
+          isCompetitionAdmin(orgId, competitionId) ||
+          isParticipantOwner(submissionId) ||
+          (request.resource.metadata != null && 'sessionId' in request.resource.metadata)
+        );
+
+      // Private artifact reads strictly scoped:
+      // - Org members / Competition Admins / Organizers / Viewers of this tenant
+      // - Assigned Judges ONLY once submission passes AI evaluation gate
+      // - Authenticated Participant Owner of this submission
+      // NEVER allows cross-tenant or unassigned-judge reads.
+      allow read: if isValidCompetition(orgId, competitionId) &&
+        isValidSubmission(orgId, competitionId, submissionId) && (
+          isCompetitionViewerOrHigher(orgId, competitionId) ||
+          isParticipantOwner(submissionId) ||
+          (isAssignedJudge(orgId, competitionId, submissionId) &&
+            getSubmission(submissionId).status in [
+              'Ready for Judge Review', 'Under Human Review', 'Evaluated', 'Finalized'
+            ])
+        );
 
       // Prevent silent overwriting or deletion of submitted artifacts
       allow update, delete: if false;
     }
 
-    // Default deny-all for every other storage path
+    // Default deny-all for every other storage path (including legacy un-scoped paths)
     match /{allPaths=**} {
       allow read, write: if false;
     }

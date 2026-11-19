@@ -4,6 +4,7 @@
 // ─────────────────────────────────────────────
 
 import React, { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import {
   Search,
   Globe,
@@ -16,6 +17,8 @@ import {
   Upload,
   FileCheck2,
   RefreshCw,
+  Sparkles,
+  Sliders,
 } from 'lucide-react';
 import { PageHeader } from '../../components/ui/PageHeader';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../../components/ui/Table';
@@ -31,8 +34,12 @@ import { competitionService } from '../../services/competitionService';
 import { submissionService } from '../../services/submissionService';
 import { submissionLifecycleService } from '../../services/submissionLifecycleService';
 import { participantTeamService } from '../../services/participantTeamService';
+import { evaluationPipelineService } from '../../services/evaluationPipelineService';
+import { AiEvaluationReportView } from '../../components/evaluation/AiEvaluationReportView';
+import { InferenceMode } from 'firebase/ai';
 import type { Competition } from '../../types/authAndCompetition';
 import type { ProjectSubmission, SubmissionStatus, TeamRecord, ParticipantRecord } from '../../types/submission';
+import type { AiEvaluationReport } from '../../types/aiEvaluation';
 
 export const SubmissionListPage: React.FC = () => {
   const { activeOrganization, currentUser } = useProoflyAuth();
@@ -54,6 +61,12 @@ export const SubmissionListPage: React.FC = () => {
   const [overrideReason, setOverrideReason] = useState('');
   const [overrideNotes, setOverrideNotes] = useState('');
   const [isApplyingOverride, setIsApplyingOverride] = useState(false);
+
+  // AI Evaluation State
+  const [evaluatingSubId, setEvaluatingSubId] = useState<string | null>(null);
+  const [selectedReport, setSelectedReport] = useState<AiEvaluationReport | null>(null);
+  const [reportModalOpen, setReportModalOpen] = useState(false);
+  const [isReportLoading, setIsReportLoading] = useState(false);
 
   // CSV Import Modal
   const [csvModalOpen, setCsvModalOpen] = useState(false);
@@ -229,6 +242,62 @@ export const SubmissionListPage: React.FC = () => {
     }
   };
 
+  const isQueuedForAi = (status: SubmissionStatus) =>
+    status === 'Queued for AI Evaluation' ||
+    status === 'AI Evaluation In Progress' ||
+    status === 'Validating' ||
+    status === 'Draft' ||
+    status === 'Submitted' ||
+    status === 'AI Evaluation Failed';
+
+  const isReadyForJudging = (status: SubmissionStatus) =>
+    status === 'Ready for Judge Review' ||
+    status === 'Under Human Review' ||
+    status === 'Evaluated' ||
+    status === 'Finalized' ||
+    status === 'AI Evaluation Complete';
+
+  const handleRunAiEvaluation = async (sub: ProjectSubmission) => {
+    setEvaluatingSubId(sub.id);
+    success('Starting AI Evaluation', `Running automated 9-step AI evaluation for "${sub.projectTitle}"...`);
+    try {
+      const comp = competitions.find((c) => c.id === sub.competitionId);
+      const res = await evaluationPipelineService.executePipeline(sub, comp, InferenceMode.PREFER_ON_DEVICE);
+      if (res.success && res.report) {
+        success(
+          'AI Evaluation Complete',
+          `Evaluated "${sub.projectTitle}" with AI score ${res.report.overallScore}/${res.report.totalMaxScore}. Submission is now Ready for Judge Review!`
+        );
+        await refreshData();
+      } else {
+        toastError('AI Evaluation Issue', res.error || 'Evaluation could not complete.');
+      }
+    } catch (err: any) {
+      toastError('AI Evaluation Failed', err?.message || 'Unexpected evaluation error.');
+    } finally {
+      setEvaluatingSubId(null);
+    }
+  };
+
+  const handleViewReport = async (sub: ProjectSubmission) => {
+    setIsReportLoading(true);
+    setReportModalOpen(true);
+    try {
+      let rep: AiEvaluationReport | null = null;
+      if (sub.aiEvaluationId) {
+        rep = await evaluationPipelineService.getEvaluationReport(sub.aiEvaluationId);
+      }
+      if (!rep) {
+        rep = await evaluationPipelineService.getReportBySubmissionId(sub.id);
+      }
+      setSelectedReport(rep);
+    } catch (err: any) {
+      console.warn('Could not load AI evaluation report:', err);
+    } finally {
+      setIsReportLoading(false);
+    }
+  };
+
   const getStatusBadge = (status: SubmissionStatus) => {
     switch (status) {
       case 'Draft':
@@ -332,6 +401,37 @@ export const SubmissionListPage: React.FC = () => {
       {mainView === 'submissions' && (
         <div className="space-y-4">
           <Tabs tabs={statusTabs} activeTab={activeTab} onChange={setActiveTab} />
+
+          {/* Workflow Quick-Start Guide */}
+          <div className="p-4 rounded-xl bg-gradient-to-r from-blue-50/80 via-indigo-50/60 to-purple-50/80 dark:from-blue-950/20 dark:via-indigo-950/15 dark:to-purple-950/20 border border-blue-200/70 dark:border-blue-900/40 flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs">
+            <div className="flex items-start gap-3">
+              <div className="w-8 h-8 rounded-lg bg-blue-600 dark:bg-blue-500 text-white flex items-center justify-center shrink-0 shadow-xs mt-0.5">
+                <Sparkles size={16} />
+              </div>
+              <div className="space-y-0.5">
+                <span className="font-bold text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
+                  Competition Evaluation & Judging Pipeline
+                </span>
+                <p className="text-slate-600 dark:text-slate-400 text-[11px] leading-relaxed">
+                  <strong>Step 1 (AI Gate):</strong> Click <strong>"Run AI Eval"</strong> on any entry to trigger the automated 9-step evidence extraction and rubric pre-scoring.
+                  <span className="mx-1.5">·</span>
+                  <strong>Step 2 (Human Review):</strong> Once evaluated, click <strong>"Score as Judge"</strong> to perform independent rubric scoring side-by-side with AI guidance.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0 self-end md:self-center">
+              <Link to="/organizer/evaluations">
+                <Button variant="outline" size="xs">
+                  Evaluation Center →
+                </Button>
+              </Link>
+              <Link to="/organizer/judges">
+                <Button variant="outline" size="xs">
+                  Judges & Assignments →
+                </Button>
+              </Link>
+            </div>
+          </div>
 
           {/* Search bar & telemetry */}
           <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
@@ -468,10 +568,15 @@ export const SubmissionListPage: React.FC = () => {
                           </button>
                         </div>
                       ) : sub.aiScore !== undefined ? (
-                        <div className="flex items-center gap-1.5 font-mono text-xs font-bold text-blue-700 dark:text-blue-400">
-                          <Zap size={12} className="text-amber-500 dark:text-amber-400" />
+                        <button
+                          type="button"
+                          onClick={() => handleViewReport(sub)}
+                          className="flex items-center gap-1.5 font-mono text-xs font-bold text-blue-700 dark:text-blue-400 hover:underline cursor-pointer group"
+                          title="Click to inspect full AI evaluation report & rubric criteria"
+                        >
+                          <Zap size={12} className="text-amber-500 dark:text-amber-400 group-hover:scale-110 transition-transform" />
                           <span>{sub.aiScore} / 100</span>
-                        </div>
+                        </button>
                       ) : (
                         <span className="text-xs text-slate-400 dark:text-slate-500">—</span>
                       )}
@@ -482,7 +587,30 @@ export const SubmissionListPage: React.FC = () => {
 
                     {/* Actions */}
                     <TableCell className="text-right">
-                      <div className="flex items-center justify-end gap-1.5">
+                      <div className="flex items-center justify-end gap-1.5 flex-wrap">
+                        {/* 1. Run AI Evaluation Button */}
+                        {isQueuedForAi(sub.status) && (
+                          <Button
+                            variant="primary"
+                            size="xs"
+                            isLoading={evaluatingSubId === sub.id}
+                            disabled={evaluatingSubId === sub.id}
+                            onClick={() => handleRunAiEvaluation(sub)}
+                          >
+                            <Sparkles size={11} className="mr-1 text-amber-300" />
+                            {sub.status === 'AI Evaluation Failed' ? 'Retry AI' : 'Run AI Eval'}
+                          </Button>
+                        )}
+
+                        {/* 2. Score as Judge Button */}
+                        <Link to={`/judge/review?id=${sub.id}`}>
+                          <Button variant={isReadyForJudging(sub.status) ? "primary" : "secondary"} size="xs">
+                            <Sliders size={11} className="mr-1" />
+                            Score as Judge
+                          </Button>
+                        </Link>
+
+                        {/* 3. Submission Dossier Modal */}
                         <Button
                           variant="outline"
                           size="xs"
@@ -754,6 +882,42 @@ export const SubmissionListPage: React.FC = () => {
                 </p>
               </div>
             )}
+
+            {/* Action Bar inside Dossier */}
+            <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center justify-end gap-2 flex-wrap">
+              {isQueuedForAi(selectedSubmission.status) && (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  isLoading={evaluatingSubId === selectedSubmission.id}
+                  disabled={evaluatingSubId === selectedSubmission.id}
+                  onClick={() => handleRunAiEvaluation(selectedSubmission)}
+                >
+                  <Sparkles size={13} className="mr-1.5 text-amber-300" />
+                  Run AI Evaluation Pipeline
+                </Button>
+              )}
+
+              {isReadyForJudging(selectedSubmission.status) && (
+                <Link to={`/judge/review?id=${selectedSubmission.id}`}>
+                  <Button variant="primary" size="sm">
+                    <Sliders size={13} className="mr-1.5" />
+                    Open Judge Review Studio
+                  </Button>
+                </Link>
+              )}
+
+              {selectedSubmission.aiScore !== undefined && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handleViewReport(selectedSubmission)}
+                >
+                  <Zap size={13} className="mr-1.5 text-amber-500" />
+                  View AI Dossier Report
+                </Button>
+              )}
+            </div>
           </div>
         </Modal>
       )}
@@ -864,6 +1028,24 @@ export const SubmissionListPage: React.FC = () => {
           </div>
         </div>
       </Modal>
+
+      {/* ── MODAL: VIEW AI EVALUATION REPORT ── */}
+      {reportModalOpen && (
+        <Modal
+          isOpen={reportModalOpen}
+          onClose={() => setReportModalOpen(false)}
+          title="AI Evaluation Report & Evidence Breakdown"
+          maxWidth="2xl"
+        >
+          {isReportLoading ? (
+            <div className="p-8 text-center text-sm text-slate-500">Loading AI evaluation report...</div>
+          ) : selectedReport ? (
+            <AiEvaluationReportView report={selectedReport} />
+          ) : (
+            <div className="p-8 text-center text-sm text-slate-500">No AI evaluation report found for this submission.</div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 };

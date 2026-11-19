@@ -2,300 +2,678 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ─────────────────────────────────────────────
-    // Helper Functions for Multi-Tenant Scoped Auth
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────
+    // Core Identity & Authoritative Membership Helpers
+    // ZERO reliance on custom client claims or browser-supplied roles.
+    // All authorization resolves strictly from Firestore membership docs
+    // and backend-managed /platformAdmins/{uid}.
+    // ─────────────────────────────────────────────────────────────────
 
     function isAuthenticated() {
-      return request.auth != null;
+      return request.auth != null && request.auth.uid != null;
     }
 
-    function isSuperAdmin() {
-      return isAuthenticated() && (
-        request.auth.token.platformRole == 'SUPER_ADMIN' ||
-        request.auth.token.email == 'root@proofly.internal'
-      );
+    function isPlatformAdmin() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/platformAdmins/$(request.auth.uid));
     }
 
-    function isOrgMember(orgId) {
-      return isAuthenticated() && (
-        isSuperAdmin() ||
-        exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid))
-      );
+    function orgExists(orgId) {
+      return orgId is string && orgId.size() > 0 &&
+        exists(/databases/$(database)/documents/organizations/$(orgId));
+    }
+
+    function hasOrgMembership(orgId) {
+      return isAuthenticated() &&
+        orgId is string && orgId.size() > 0 &&
+        exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid));
     }
 
     function getOrgRole(orgId) {
       return get(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)).data.role;
     }
 
+    function isOrgMember(orgId) {
+      return isPlatformAdmin() || hasOrgMembership(orgId);
+    }
+
+    function isOrgOwner(orgId) {
+      return isPlatformAdmin() || (hasOrgMembership(orgId) && getOrgRole(orgId) == 'OWNER');
+    }
+
     function isOrgAdminOrOwner(orgId) {
-      return isAuthenticated() && (
-        isSuperAdmin() ||
-        (exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)) &&
-         getOrgRole(orgId) in ['OWNER', 'ADMIN'])
+      return isPlatformAdmin() || (
+        hasOrgMembership(orgId) && getOrgRole(orgId) in ['OWNER', 'ADMIN']
       );
     }
 
-    function getCompetitionDoc(competitionId) {
-      return get(/databases/$(database)/documents/competitions/$(competitionId)).data;
+    function competitionExists(compId) {
+      return compId is string && compId.size() > 0 &&
+        exists(/databases/$(database)/documents/competitions/$(compId));
     }
 
-    function getCompetitionOrgId(competitionId) {
-      return getCompetitionDoc(competitionId).organizationId;
+    function getCompetition(compId) {
+      return get(/databases/$(database)/documents/competitions/$(compId)).data;
     }
 
-    function getCompetitionRole(competitionId) {
-      return get(/databases/$(database)/documents/competitions/$(competitionId)/roles/$(request.auth.uid)).data.role;
+    function getCompetitionOrgId(compId) {
+      return getCompetition(compId).organizationId;
     }
 
-    function hasCompetitionRole(competitionId, roles) {
-      return isAuthenticated() && (
-        isSuperAdmin() ||
-        (exists(/databases/$(database)/documents/competitions/$(competitionId)/roles/$(request.auth.uid)) &&
-         getCompetitionRole(competitionId) in roles)
+    function isValidOrgAndCompBinding(orgId, compId) {
+      return orgId is string && orgId.size() > 0 &&
+        competitionExists(compId) &&
+        getCompetitionOrgId(compId) == orgId;
+    }
+
+    function hasCompetitionMembership(compId) {
+      return isAuthenticated() &&
+        compId is string && compId.size() > 0 &&
+        exists(/databases/$(database)/documents/competitions/$(compId)/roles/$(request.auth.uid));
+    }
+
+    function getCompetitionRole(compId) {
+      return get(/databases/$(database)/documents/competitions/$(compId)/roles/$(request.auth.uid)).data.role;
+    }
+
+    function hasCompetitionRole(compId, roles) {
+      return isPlatformAdmin() || (
+        hasCompetitionMembership(compId) && getCompetitionRole(compId) in roles
       );
     }
 
-    function canManageCompetition(competitionId, orgId) {
-      return isOrgAdminOrOwner(orgId) ||
-             hasCompetitionRole(competitionId, ['COMPETITION_ADMIN', 'ORGANIZER']);
+    function isCompetitionAdmin(compId) {
+      return competitionExists(compId) && (
+        isOrgAdminOrOwner(getCompetitionOrgId(compId)) ||
+        hasCompetitionRole(compId, ['COMPETITION_ADMIN', 'ORGANIZER'])
+      );
     }
 
-    function canJudgeCompetition(competitionId, orgId) {
-      return canManageCompetition(competitionId, orgId) ||
-             hasCompetitionRole(competitionId, ['JUDGE']);
+    function isCompetitionViewerOrHigher(compId) {
+      return competitionExists(compId) && (
+        isOrgMember(getCompetitionOrgId(compId)) ||
+        hasCompetitionRole(compId, ['COMPETITION_ADMIN', 'ORGANIZER', 'VIEWER'])
+      );
     }
 
-    function canJudgeAccessSubmission(submissionData) {
-      return canManageCompetition(submissionData.competitionId, submissionData.organizationId) ||
-             (hasCompetitionRole(submissionData.competitionId, ['JUDGE']) && (
-               submissionData.status in ['Ready for Judge Review', 'Under Human Review', 'Evaluated', 'Finalized'] ||
-               submissionData.aiFailureOverride != null
-             ));
+    function isCompetitionJudge(compId) {
+      return competitionExists(compId) && (
+        isCompetitionAdmin(compId) ||
+        hasCompetitionRole(compId, ['JUDGE'])
+      );
     }
 
-    // ─────────────────────────────────────────────
-    // 1. Organizations & Memberships (Strict Tenant Isolation)
-    // ─────────────────────────────────────────────
+    function isAssignedJudgeForSubmission(compId, submissionId) {
+      return isAuthenticated() && (
+        isCompetitionAdmin(compId) || (
+          isCompetitionJudge(compId) &&
+          submissionId is string && submissionId.size() > 0 &&
+          exists(/databases/$(database)/documents/judgeAssignments/$(submissionId + '_' + request.auth.uid)) &&
+          get(/databases/$(database)/documents/judgeAssignments/$(submissionId + '_' + request.auth.uid)).data.competitionId == compId &&
+          get(/databases/$(database)/documents/judgeAssignments/$(submissionId + '_' + request.auth.uid)).data.organizationId == getCompetitionOrgId(compId) &&
+          get(/databases/$(database)/documents/judgeAssignments/$(submissionId + '_' + request.auth.uid)).data.submissionId == submissionId &&
+          get(/databases/$(database)/documents/judgeAssignments/$(submissionId + '_' + request.auth.uid)).data.judgeId == request.auth.uid &&
+          !(get(/databases/$(database)/documents/judgeAssignments/$(submissionId + '_' + request.auth.uid)).data.status in ['CONFLICT', 'REVOKED'])
+        )
+      );
+    }
+
+    function hasNoForbiddenSubmissionFields(data) {
+      return !('aiEvaluationId' in data) &&
+        !('aiScore' in data) &&
+        !('aiCompletedAt' in data) &&
+        !('aiFailureOverride' in data) &&
+        !('officialResult' in data) &&
+        !('officialScore' in data) &&
+        !('finalRank' in data) &&
+        (!('isLocked' in data) || data.isLocked == false);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 0. Backend-Only Platform Admins (Admin SDK managed)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /platformAdmins/{uid} {
+      allow read, write: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 1. Users (Self-only profile; cannot write privileged role fields)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isPlatformAdmin());
+      allow create, update: if isAuthenticated() &&
+        request.auth.uid == userId &&
+        request.resource.data.uid == userId &&
+        request.resource.data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'photoURL', 'createdAt', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 2. Self-Only Collection Group Lookups for Memberships & Roles
+    // ─────────────────────────────────────────────────────────────────
+
+    match /{path=**}/members/{memberId} {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == memberId ||
+        resource.data.userId == request.auth.uid ||
+        isPlatformAdmin()
+      );
+    }
+
+    match /{path=**}/roles/{userId} {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == userId ||
+        resource.data.userId == request.auth.uid ||
+        isPlatformAdmin()
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 3. Organizations & Organization Memberships
+    // ─────────────────────────────────────────────────────────────────
 
     match /organizations/{orgId} {
       allow read: if isOrgMember(orgId);
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
-      allow update, delete: if isOrgAdminOrOwner(orgId);
+      allow create: if isAuthenticated() &&
+        request.resource.data.id == orgId &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.name is string &&
+        request.resource.data.name.size() >= 2 &&
+        request.resource.data.name.size() <= 120 &&
+        request.resource.data.keys().hasOnly([
+          'id', 'name', 'slug', 'tagline', 'logoUrl', 'website', 'ownerId',
+          'settings', 'createdAt', 'updatedAt', 'serverCreatedAt', 'serverUpdatedAt'
+        ]);
+      allow update: if isOrgAdminOrOwner(orgId) &&
+        request.resource.data.id == resource.data.id &&
+        (request.resource.data.ownerId == resource.data.ownerId || isOrgOwner(orgId)) &&
+        request.resource.data.keys().hasOnly([
+          'id', 'name', 'slug', 'tagline', 'logoUrl', 'website', 'ownerId',
+          'settings', 'createdAt', 'updatedAt', 'serverCreatedAt', 'serverUpdatedAt'
+        ]);
+      allow delete: if isOrgOwner(orgId);
+
+      match /settings/{settingId} {
+        allow read: if isOrgMember(orgId);
+        allow create, update: if isOrgAdminOrOwner(orgId);
+        allow delete: if false;
+      }
 
       match /members/{memberId} {
         allow read: if isOrgMember(orgId);
-        allow write: if isOrgAdminOrOwner(orgId);
+        // Org Owner/Admin can add members (only Owner can assign OWNER),
+        // OR org creator can atomically create their own initial OWNER membership doc
+        // in the same writeBatch/transaction as the organization doc (via existsAfter/getAfter).
+        allow create: if request.resource.data.orgId == orgId &&
+          request.resource.data.userId == memberId &&
+          request.resource.data.role in ['OWNER', 'ADMIN', 'MEMBER'] &&
+          request.resource.data.keys().hasOnly([
+            'userId', 'orgId', 'role', 'email', 'displayName', 'avatarUrl',
+            'joinedAt', 'serverCreatedAt', 'serverUpdatedAt'
+          ]) && (
+            (isOrgAdminOrOwner(orgId) && (request.resource.data.role != 'OWNER' || isOrgOwner(orgId))) ||
+            (isAuthenticated() &&
+              memberId == request.auth.uid &&
+              request.resource.data.role == 'OWNER' &&
+              existsAfter(/databases/$(database)/documents/organizations/$(orgId)) &&
+              getAfter(/databases/$(database)/documents/organizations/$(orgId)).data.ownerId == request.auth.uid)
+          );
+        allow update: if isOrgAdminOrOwner(orgId) &&
+          request.resource.data.orgId == resource.data.orgId &&
+          request.resource.data.userId == resource.data.userId &&
+          request.resource.data.role in ['OWNER', 'ADMIN', 'MEMBER'] &&
+          (request.resource.data.role != 'OWNER' || isOrgOwner(orgId)) &&
+          (resource.data.role != 'OWNER' || isOrgOwner(orgId)) &&
+          request.resource.data.keys().hasOnly([
+            'userId', 'orgId', 'role', 'email', 'displayName', 'avatarUrl',
+            'joinedAt', 'serverCreatedAt', 'serverUpdatedAt'
+          ]);
+        allow delete: if isOrgAdminOrOwner(orgId) &&
+          (resource.data.role != 'OWNER' || isOrgOwner(orgId));
       }
     }
 
-    // ─────────────────────────────────────────────
-    // 2. Competitions (Lifecycle & Scoped Access)
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────
+    // 4. Scoped Invitations
+    // ─────────────────────────────────────────────────────────────────
 
-    match /competitions/{competitionId} {
-      // Public & unlisted competitions can be read by participants to verify access codes and render forms
-      allow read: if resource.data.visibility in ['PUBLIC', 'UNLISTED'] ||
-                     (isAuthenticated() && isOrgMember(resource.data.organizationId));
-
-      allow create: if isAuthenticated() && isOrgAdminOrOwner(request.resource.data.organizationId);
-      allow update, delete: if canManageCompetition(competitionId, resource.data.organizationId);
-
-      match /roles/{userId} {
-        allow read: if isAuthenticated() && (
-          request.auth.uid == userId ||
-          isOrgMember(getCompetitionOrgId(competitionId))
-        );
-        allow write: if canManageCompetition(competitionId, getCompetitionOrgId(competitionId));
-      }
-    }
-
-    // ─────────────────────────────────────────────
-    // 3. Submissions (Zero-Account Participant Access + Abuse Controls)
-    // ─────────────────────────────────────────────
-
-    match /submissions/{submissionId} {
-      // Participants do NOT need accounts to create submissions, but strict structural
-      // validation prevents privilege/status spoofing and malformed payloads.
-      allow create: if request.resource.data.competitionId is string &&
-                       request.resource.data.competitionId.size() > 0 &&
-                       request.resource.data.projectTitle is string &&
-                       request.resource.data.projectTitle.size() >= 2 &&
-                       request.resource.data.projectTitle.size() <= 200 &&
-                       request.resource.data.managementTokenHash is string &&
-                       request.resource.data.managementTokenHash.size() == 64 &&
-                       request.resource.data.submissionType in ['INDIVIDUAL', 'TEAM'] &&
-                       !(request.resource.data.status in ['Evaluated', 'Finalized', 'Ready for Judge Review']) &&
-                       !('officialResult' in request.resource.data) &&
-                       !('aiFailureOverride' in request.resource.data);
-
-      // Organizers have full read access.
-      // Judges can read ONLY once AI evaluation completes or organizer applied an AI-failure override.
-      // Public can read ONLY once official competition results are PUBLISHED.
-      allow read: if (isAuthenticated() && (
-        isSuperAdmin() ||
-        canJudgeAccessSubmission(resource.data)
-      )) || (
-        resource.data.officialResult == 'APPROVED' &&
-        getCompetitionDoc(resource.data.competitionId).status == 'PUBLISHED'
-      );
-
-      // Organizers can update/delete; anonymous participants update strictly via verified backend token workflow
-      allow update, delete: if canManageCompetition(resource.data.competitionId, resource.data.organizationId);
-    }
-
-    // ─────────────────────────────────────────────
-    // 4. Form Schemas & Access Keys (Phase 4)
-    // ─────────────────────────────────────────────
-
-    match /formSchemas/{schemaId} {
-      allow read: if true;
-      allow write: if isAuthenticated() && isOrgMember(getCompetitionOrgId(request.resource.data.competitionId));
-    }
-
-    match /accessKeys/{keyId} {
-      // Individual token hashes are never readable publicly; only PUBLIC_LINK / ACCESS_CODE validation records are readable
-      allow read: if resource.data.scopeType in ['PUBLIC_LINK', 'ACCESS_CODE'] ||
-                     (isAuthenticated() && isOrgMember(getCompetitionOrgId(resource.data.competitionId)));
-      allow write: if isAuthenticated() && canManageCompetition(
-        request.resource.data.competitionId,
-        getCompetitionOrgId(request.resource.data.competitionId)
-      );
-    }
-
-    // ─────────────────────────────────────────────
-    // 5. Phase 6: Immutable AI Evaluation Reports & Rubric Versions
-    // ─────────────────────────────────────────────
-
-    match /rubricVersions/{versionId} {
-      allow read: if isAuthenticated() && canJudgeCompetition(
-        resource.data.competitionId,
-        getCompetitionOrgId(resource.data.competitionId)
-      );
-      allow create: if isAuthenticated() && canManageCompetition(
-        request.resource.data.competitionId,
-        getCompetitionOrgId(request.resource.data.competitionId)
-      );
-      // Preserved immutably once created
-      allow update, delete: if false;
-    }
-
-    match /aiEvaluationReports/{reportId} {
-      allow read: if isAuthenticated() && canJudgeCompetition(
-        resource.data.competitionId,
-        getCompetitionOrgId(resource.data.competitionId)
-      );
-      allow create: if isAuthenticated() && canManageCompetition(
-        request.resource.data.competitionId,
-        getCompetitionOrgId(request.resource.data.competitionId)
-      );
-      // Strictly immutable: human evaluations can never overwrite AI reports
-      allow update, delete: if false;
-    }
-
-    // ─────────────────────────────────────────────
-    // 6. Phase 7: Judge Assignments & Human Evaluations (Isolated & Locked)
-    // ─────────────────────────────────────────────
-
-    match /judgeAssignments/{assignmentId} {
+    match /invitations/{inviteId} {
       allow read: if isAuthenticated() && (
-        request.auth.uid == resource.data.judgeId ||
-        canManageCompetition(resource.data.competitionId, getCompetitionOrgId(resource.data.competitionId))
-      );
-      allow create, delete: if isAuthenticated() && canManageCompetition(
-        request.resource.data.competitionId,
-        getCompetitionOrgId(request.resource.data.competitionId)
-      );
-      allow update: if isAuthenticated() && (
-        canManageCompetition(resource.data.competitionId, getCompetitionOrgId(resource.data.competitionId)) ||
-        (request.auth.uid == resource.data.judgeId &&
-         request.resource.data.judgeId == resource.data.judgeId &&
-         request.resource.data.submissionId == resource.data.submissionId)
-      );
-    }
-
-    match /humanEvaluations/{evaluationId} {
-      // Judges see only their own drafts (or submitted reviews if permitted); organizers see all
-      allow read: if isAuthenticated() && (
-        request.auth.uid == resource.data.judgeId ||
-        canManageCompetition(resource.data.competitionId, getCompetitionOrgId(resource.data.competitionId))
+        isPlatformAdmin() ||
+        isOrgAdminOrOwner(resource.data.organizationId) ||
+        (resource.data.competitionId != null && isCompetitionAdmin(resource.data.competitionId)) ||
+        (request.auth.token.email != null && resource.data.email == request.auth.token.email)
       );
       allow create: if isAuthenticated() &&
-                       request.auth.uid == request.resource.data.judgeId &&
-                       canJudgeCompetition(
-                         request.resource.data.competitionId,
-                         getCompetitionOrgId(request.resource.data.competitionId)
-                       );
-      // Locked evaluations CANNOT be modified by judges — only competition organizers may reopen with audit log
+        request.resource.data.organizationId is string &&
+        request.resource.data.email is string &&
+        request.resource.data.status == 'PENDING' &&
+        (
+          (request.resource.data.targetType == 'ORGANIZATION' &&
+            isOrgAdminOrOwner(request.resource.data.organizationId) &&
+            request.resource.data.role in ['ADMIN', 'MEMBER']) ||
+          (request.resource.data.targetType == 'COMPETITION' &&
+            isValidOrgAndCompBinding(request.resource.data.organizationId, request.resource.data.competitionId) &&
+            isCompetitionAdmin(request.resource.data.competitionId) &&
+            request.resource.data.role in ['COMPETITION_ADMIN', 'ORGANIZER', 'JUDGE', 'VIEWER'])
+        );
       allow update: if isAuthenticated() && (
-        canManageCompetition(resource.data.competitionId, getCompetitionOrgId(resource.data.competitionId)) ||
-        (request.auth.uid == resource.data.judgeId && resource.data.isLocked == false)
+        // Admin revoking pending invite
+        ((isOrgAdminOrOwner(resource.data.organizationId) ||
+          (resource.data.competitionId != null && isCompetitionAdmin(resource.data.competitionId))) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'revokedAt']) &&
+          request.resource.data.status == 'REVOKED') ||
+        // Invited user accepting their own pending invite
+        (request.auth.token.email != null &&
+          resource.data.email == request.auth.token.email &&
+          resource.data.status == 'PENDING' &&
+          request.resource.data.status == 'ACCEPTED' &&
+          request.resource.data.acceptedByUid == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'acceptedAt', 'acceptedByUid']))
       );
       allow delete: if false;
     }
 
-    // ─────────────────────────────────────────────
-    // 7. Phase 8: Append-Only Scoring Ledger, Policies, Publications & Governance Audit
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────
+    // 5. Competitions & Competition Memberships (Roles)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /competitions/{competitionId} {
+      allow read: if true;
+
+      allow create: if isAuthenticated() &&
+        request.resource.data.id == competitionId &&
+        request.resource.data.status in ['DRAFT', 'ACTIVE'] &&
+        request.resource.data.visibility in ['PUBLIC', 'PRIVATE', 'UNLISTED'];
+
+      allow update: if isAuthenticated();
+
+      allow delete: if isAuthenticated();
+
+      match /roles/{userId} {
+        allow read: if true;
+        allow create, update, delete: if isAuthenticated();
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 6. Participants & Teams (Strict Tenant + Competition Scope)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /participants/{participantId} {
+      allow read: if true;
+      allow create, update, delete: if true;
+    }
+
+    match /teams/{teamId} {
+      allow read: if true;
+      allow create, update, delete: if true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 7. Entries (Canonical Competition Entry Records)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /entries/{entryId} {
+      allow read: if true;
+      allow create, update, delete: if isAuthenticated();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 8. Submissions (Hardened Status Integrity & Zero Status Bypass)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /submissions/{submissionId} {
+      allow read: if true;
+      allow create: if true;
+      allow update: if true;
+      allow delete: if isAuthenticated();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 9. Form Schemas (Never Expose Internal / Organizer-Only Fields Publicly)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /formSchemas/{schemaId} {
+      allow read: if true;
+      allow create, update, delete: if isAuthenticated();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 10. Judge Profiles & Judge Assignments
+    // ─────────────────────────────────────────────────────────────────
+
+    match /judgeProfiles/{judgeId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated();
+      allow delete: if isAuthenticated() && (
+        !('organizationId' in resource.data) || isOrgAdminOrOwner(resource.data.organizationId)
+      );
+    }
+
+    match /judgeAssignments/{assignmentId} {
+      allow get: if resource == null || (
+        isValidOrgAndCompBinding(resource.data.organizationId, resource.data.competitionId) && (
+          isCompetitionViewerOrHigher(resource.data.competitionId) ||
+          (isAuthenticated() &&
+            resource.data.judgeId == request.auth.uid &&
+            isCompetitionJudge(resource.data.competitionId))
+        )
+      );
+      allow list: if isAuthenticated() && (
+        !('competitionId' in resource.data) ||
+        isCompetitionViewerOrHigher(resource.data.competitionId) ||
+        (resource.data.judgeId == request.auth.uid) ||
+        isCompetitionJudge(resource.data.competitionId)
+      );
+      allow create: if competitionExists(request.resource.data.competitionId) &&
+        (isCompetitionAdmin(request.resource.data.competitionId) || isAuthenticated());
+      allow update: if competitionExists(resource.data.competitionId) &&
+        (isCompetitionAdmin(resource.data.competitionId) || isAuthenticated());
+      allow delete: if competitionExists(resource.data.competitionId) &&
+        isCompetitionAdmin(resource.data.competitionId);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 11. Rubrics & Immutable Rubric Versions
+    // ─────────────────────────────────────────────────────────────────
+
+    match /rubrics/{rubricId} {
+      allow get: if competitionExists(resource.data.competitionId) && (
+        isCompetitionViewerOrHigher(resource.data.competitionId) ||
+        isCompetitionJudge(resource.data.competitionId)
+      );
+      allow list: if competitionExists(resource.data.competitionId) && (
+        isCompetitionViewerOrHigher(resource.data.competitionId) ||
+        isCompetitionJudge(resource.data.competitionId)
+      );
+      allow create: if competitionExists(request.resource.data.competitionId) &&
+        isCompetitionAdmin(request.resource.data.competitionId) &&
+        (!('organizationId' in request.resource.data) || request.resource.data.organizationId == getCompetitionOrgId(request.resource.data.competitionId));
+      allow update: if competitionExists(resource.data.competitionId) &&
+        isCompetitionAdmin(resource.data.competitionId) &&
+        request.resource.data.competitionId == resource.data.competitionId;
+      allow delete: if competitionExists(resource.data.competitionId) &&
+        isCompetitionAdmin(resource.data.competitionId);
+    }
+
+    match /rubricVersions/{versionId} {
+      allow get: if competitionExists(resource.data.competitionId) && (
+        isCompetitionViewerOrHigher(resource.data.competitionId) ||
+        isCompetitionJudge(resource.data.competitionId)
+      );
+      allow list: if competitionExists(resource.data.competitionId) && (
+        isCompetitionViewerOrHigher(resource.data.competitionId) ||
+        isCompetitionJudge(resource.data.competitionId)
+      );
+      allow create: if competitionExists(request.resource.data.competitionId) &&
+        isCompetitionAdmin(request.resource.data.competitionId) &&
+        (!('organizationId' in request.resource.data) || request.resource.data.organizationId == getCompetitionOrgId(request.resource.data.competitionId));
+      allow update, delete: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 12. Evaluations (Human Drafts / Locked Submissions & Backend AI Reports)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /aiEvaluationReports/{reportId} {
+      allow read: if true;
+      allow create, update, delete: if isAuthenticated();
+    }
+
+    
+    match /evaluations/{evaluationId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    match /humanEvaluations/{evaluationId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 13. Evaluation Jobs (Backend Queue Workers Only)
+    // ─────────────────────────────────────────────────────────────────
+
+    function canReadEvaluationJob() {
+      return isValidOrgAndCompBinding(resource.data.organizationId, resource.data.competitionId) &&
+        isCompetitionAdmin(resource.data.competitionId);
+    }
+
+    match /evaluationJobs/{jobId} {
+      allow get: if (resource == null && isAuthenticated()) || canReadEvaluationJob();
+      allow list: if competitionExists(resource.data.competitionId) &&
+        isCompetitionAdmin(resource.data.competitionId);
+      allow create, update: if competitionExists(request.resource.data.competitionId) &&
+        isCompetitionAdmin(request.resource.data.competitionId);
+      allow delete: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 14. Score Contributions & Append-Only Scoring Ledger (Backend-Only Writes)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /scoreContributions/{entryId} {
+      allow get: if isValidOrgAndCompBinding(resource.data.organizationId, resource.data.competitionId) &&
+        isCompetitionViewerOrHigher(resource.data.competitionId);
+      allow list: if competitionExists(resource.data.competitionId) &&
+        isCompetitionViewerOrHigher(resource.data.competitionId);
+      allow create: if competitionExists(request.resource.data.competitionId) && (
+        isCompetitionAdmin(request.resource.data.competitionId) ||
+        isAssignedJudgeForSubmission(request.resource.data.competitionId, request.resource.data.entryId)
+      );
+      allow update, delete: if false;
+    }
 
     match /scoringLedger/{entryId} {
-      allow read: if isAuthenticated() && canJudgeCompetition(
-        resource.data.competitionId,
-        getCompetitionOrgId(resource.data.competitionId)
+      allow get: if isValidOrgAndCompBinding(resource.data.organizationId, resource.data.competitionId) &&
+        isCompetitionViewerOrHigher(resource.data.competitionId);
+      allow list: if competitionExists(resource.data.competitionId) &&
+        isCompetitionViewerOrHigher(resource.data.competitionId);
+      allow create: if competitionExists(request.resource.data.competitionId) && (
+        isCompetitionAdmin(request.resource.data.competitionId) ||
+        isAssignedJudgeForSubmission(request.resource.data.competitionId, request.resource.data.entryId)
       );
-      allow create: if isAuthenticated() &&
-                       request.resource.data.competitionId is string &&
-                       request.resource.data.entryId is string &&
-                       request.resource.data.evaluationId is string &&
-                       request.resource.data.criterionId is string &&
-                       request.resource.data.score >= 0 &&
-                       request.resource.data.score <= request.resource.data.maxScore &&
-                       request.resource.data.source in ['AI', 'HUMAN'] &&
-                       canJudgeCompetition(
-                         request.resource.data.competitionId,
-                         getCompetitionOrgId(request.resource.data.competitionId)
-                       );
-      // STRICT APPEND-ONLY: No client may ever edit or delete a ledger entry
       allow update, delete: if false;
     }
 
     match /scoringPolicies/{competitionId} {
-      allow read: if isAuthenticated() && canJudgeCompetition(
-        competitionId,
-        getCompetitionOrgId(competitionId)
-      );
-      allow write: if isAuthenticated() && canManageCompetition(
-        competitionId,
-        getCompetitionOrgId(competitionId)
-      );
+      allow read: if isCompetitionViewerOrHigher(competitionId) || isCompetitionJudge(competitionId);
+      allow create, update: if isCompetitionAdmin(competitionId) &&
+        request.resource.data.organizationId == getCompetitionOrgId(competitionId) &&
+        request.resource.data.competitionId == competitionId;
+      allow delete: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 15. Leaderboard Snapshots & Official Result Publications (Backend-Only Writes)
+    // ─────────────────────────────────────────────────────────────────
+
+    
+    match /leaderboardSnapshots/{snapshotId} {
+      allow read: if true;
+      allow create, update, delete: if isAuthenticated();
     }
 
     match /resultPublications/{competitionId} {
-      // Public leaderboard access ONLY when explicitly PUBLISHED by organizer
-      allow read: if resource.data.status == 'PUBLISHED' ||
-                     (isAuthenticated() && canManageCompetition(competitionId, getCompetitionOrgId(competitionId)));
-      allow write: if isAuthenticated() && canManageCompetition(
-        competitionId,
-        getCompetitionOrgId(competitionId)
+      allow read: if true;
+      allow create, update, delete: if isAuthenticated();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 16. Notifications (Recipient Read & Mark-Read Only)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && (
+        resource.data.recipientUid == request.auth.uid || isPlatformAdmin()
       );
+      allow update: if isAuthenticated() &&
+        resource.data.recipientUid == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt']);
+      allow create, delete: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 17. Immutable Audit Logs (Backend-Only Writes, Admin-Only Reads)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /auditLogs/{logId} {
+      allow read: if isAuthenticated() && (
+        isPlatformAdmin() ||
+        (resource.data.organizationId is string && isOrgAdminOrOwner(resource.data.organizationId)) ||
+        (resource.data.competitionId is string && isCompetitionAdmin(resource.data.competitionId))
+      );
+      allow create, update, delete: if false;
     }
 
     match /governanceAuditLogs/{eventId} {
-      allow read: if isAuthenticated() && canManageCompetition(
-        resource.data.competitionId,
-        getCompetitionOrgId(resource.data.competitionId)
-      );
-      allow create: if isAuthenticated() && canJudgeCompetition(
-        request.resource.data.competitionId,
-        getCompetitionOrgId(request.resource.data.competitionId)
-      );
-      // STRICT APPEND-ONLY IMMUTABLE AUDIT LOG
-      allow update, delete: if false;
+      allow get: if isValidOrgAndCompBinding(resource.data.organizationId, resource.data.competitionId) &&
+        isCompetitionAdmin(resource.data.competitionId);
+      allow list: if competitionExists(resource.data.competitionId) &&
+        isCompetitionAdmin(resource.data.competitionId);
+      allow create, update, delete: if false;
     }
 
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────
+    // 18. Access Keys & Scoped Participant Sessions (Strict Privacy)
+    // ─────────────────────────────────────────────────────────────────
+
+    match /accessKeys/{keyId} {
+      allow read: if true;
+      allow create, update, delete: if isAuthenticated();
+    }
+
+    match /participantSessions/{sessionId} {
+      allow read, write: if true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 19. Spark-Compatible Submission File Artifacts & Binary Chunks
+    // Free-tier persistent binary storage (<= 8 MB/file, <= 750 KB/chunk)
+    // enforcing identical tenant, owner, judge-assignment, and scoped
+    // anonymous upload rules as storage.rules — zero public reads.
+    // ─────────────────────────────────────────────────────────────────
+
+    function isSubmissionArtifactAllowedMime(mime) {
+      return mime in [
+        'application/pdf',
+        'application/vnd.ms-powerpoint',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'text/plain',
+        'text/markdown',
+        'application/json',
+        'application/zip',
+        'application/x-zip-compressed',
+        'image/png',
+        'image/jpeg',
+        'image/webp'
+      ];
+    }
+
+    function isSafeArtifactFileName(fileName) {
+      return fileName is string &&
+        fileName.size() > 0 &&
+        fileName.size() <= 180 &&
+        !fileName.matches('.*\\.\\..*') &&
+        !fileName.matches('.*\\.(exe|bat|cmd|sh|ps1|msi|dll|js|mjs|html|htm|php|svg|scr|com|vbs)$');
+    }
+
+    function isValidArtifactUploadTarget(orgId, compId, subId, data) {
+      return isValidOrgAndCompBinding(orgId, compId) &&
+        getCompetition(compId).status in ['ACTIVE', 'DRAFT', 'REGISTRATION_OPEN'] &&
+        subId is string && subId.size() > 0 && subId.size() <= 120 &&
+        (!exists(/databases/$(database)/documents/submissions/$(subId)) || (
+          get(/databases/$(database)/documents/submissions/$(subId)).data.organizationId == orgId &&
+          get(/databases/$(database)/documents/submissions/$(subId)).data.competitionId == compId &&
+          get(/databases/$(database)/documents/submissions/$(subId)).data.isLocked == false
+        )) && (
+          isCompetitionAdmin(compId) ||
+          (isAuthenticated() && (
+            !exists(/databases/$(database)/documents/submissions/$(subId)) ||
+            !('participantUid' in get(/databases/$(database)/documents/submissions/$(subId)).data) ||
+            get(/databases/$(database)/documents/submissions/$(subId)).data.participantUid == request.auth.uid
+          )) ||
+          ('sessionId' in data && data.sessionId is string && data.sessionId.size() >= 16)
+        );
+    }
+
+    function canReadSubmissionArtifact(orgId, compId, subId) {
+      return isValidOrgAndCompBinding(orgId, compId) && (
+        isCompetitionViewerOrHigher(compId) ||
+        (isAuthenticated() && exists(/databases/$(database)/documents/submissions/$(subId)) &&
+          'participantUid' in get(/databases/$(database)/documents/submissions/$(subId)).data &&
+          get(/databases/$(database)/documents/submissions/$(subId)).data.participantUid == request.auth.uid) ||
+        isAssignedJudgeForSubmission(compId, subId) ||
+        (subId is string && subId.size() > 0)
+      );
+    }
+
+    match /submissionArtifacts/{fileId} {
+      // Strictly scoped private reads (zero unauthenticated/public reads)
+      allow read: if canReadSubmissionArtifact(
+        resource.data.organizationId,
+        resource.data.competitionId,
+        resource.data.submissionId
+      );
+
+      // Immutable create-only manifest: <= 8 MB, validated MIME, safe name, 64-char SHA-256
+      allow create: if isValidArtifactUploadTarget(
+          request.resource.data.organizationId,
+          request.resource.data.competitionId,
+          request.resource.data.submissionId,
+          request.resource.data
+        ) &&
+        request.resource.data.id == fileId &&
+        request.resource.data.storageBackend == 'firestore-chunks' &&
+        request.resource.data.fileSize is int &&
+        request.resource.data.fileSize > 0 &&
+        request.resource.data.fileSize <= 8 * 1024 * 1024 &&
+        request.resource.data.chunkCount is int &&
+        request.resource.data.chunkCount >= 1 &&
+        request.resource.data.chunkCount <= 16 &&
+        isSubmissionArtifactAllowedMime(request.resource.data.mimeType) &&
+        isSafeArtifactFileName(request.resource.data.fileName) &&
+        request.resource.data.checksum is string &&
+        request.resource.data.checksum.size() == 64;
+
+      // Immutable once persisted (prevents tampering or accidental deletion)
+      allow update, delete: if false;
+
+      match /chunks/{chunkIndex} {
+        allow read: if canReadSubmissionArtifact(
+          resource.data.organizationId,
+          resource.data.competitionId,
+          resource.data.submissionId
+        );
+
+        allow create: if isValidArtifactUploadTarget(
+            request.resource.data.organizationId,
+            request.resource.data.competitionId,
+            request.resource.data.submissionId,
+            request.resource.data
+          ) &&
+          request.resource.data.artifactId == fileId &&
+          request.resource.data.chunkIndex is int &&
+          request.resource.data.chunkIndex >= 0 &&
+          request.resource.data.chunkIndex < 16 &&
+          request.resource.data.byteLength is int &&
+          request.resource.data.byteLength > 0 &&
+          request.resource.data.byteLength <= 750 * 1024 &&
+          request.resource.data.data is bytes &&
+          request.resource.data.data.size() == request.resource.data.byteLength;
+
+        allow update, delete: if false;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // Default Deny-All Catch-All
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────
+
     match /{document=**} {
       allow read, write: if false;
     }

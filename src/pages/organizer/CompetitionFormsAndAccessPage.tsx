@@ -23,13 +23,14 @@ import { AccessManagementPanel } from '../../components/forms/AccessManagementPa
 import { useProoflyAuth } from '../../context/ProoflyAuthContext';
 import { competitionService } from '../../services/competitionService';
 import { formBuilderService } from '../../services/formBuilderService';
+import { authorizationService } from '../../services/authorizationService';
 import { useToast } from '../../components/ui/Toast';
 import type { Competition } from '../../types/authAndCompetition';
 import type { SubmissionFormSchema } from '../../types/formAndAccess';
 
 export const CompetitionFormsAndAccessPage: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
-  const { activeOrganization, canManageCurrentOrg, loading: authLoading } = useProoflyAuth();
+  const { activeOrganization, verifiedSession, canManageCurrentOrg, loading: authLoading } = useProoflyAuth();
   const { success, error: toastError } = useToast();
 
   const [competitions, setCompetitions] = useState<Competition[]>([]);
@@ -91,17 +92,35 @@ export const CompetitionFormsAndAccessPage: React.FC = () => {
     }
     try {
       setLoading(true);
-      const schema = await formBuilderService.getFormSchema(
-        selectedCompId,
-        selectedRoundId || undefined
-      );
+      let schema: SubmissionFormSchema | null = null;
+      try {
+        schema = await formBuilderService.getFormSchema(
+          selectedCompId,
+          selectedRoundId || undefined
+        );
+      } catch (err: any) {
+        console.warn('Could not fetch schema from Firestore, using default template:', err);
+      }
+
+      if (!schema) {
+        schema = formBuilderService.generateDefaultHackathonSchema(
+          selectedCompId,
+          activeOrganization?.id
+        );
+      }
       setCurrentSchema(schema);
     } catch (err: any) {
-      toastError('Failed to load form schema', err.message);
+      console.warn('Fallback to default hackathon schema:', err);
+      setCurrentSchema(
+        formBuilderService.generateDefaultHackathonSchema(
+          selectedCompId,
+          activeOrganization?.id
+        )
+      );
     } finally {
       setLoading(false);
     }
-  }, [selectedCompId, selectedRoundId, toastError]);
+  }, [selectedCompId, selectedRoundId, activeOrganization?.id]);
 
   useEffect(() => {
     loadSchema();
@@ -111,6 +130,11 @@ export const CompetitionFormsAndAccessPage: React.FC = () => {
     if (!selectedCompId) return;
     try {
       setSavingSchema(true);
+      await authorizationService.assertAuthorized(verifiedSession, {
+        operation: 'FORM_MANAGE',
+        organizationId: activeOrganization?.id,
+        competitionId: selectedCompId,
+      });
       await formBuilderService.saveFormSchema(
         selectedCompId,
         updatedSchema.title,

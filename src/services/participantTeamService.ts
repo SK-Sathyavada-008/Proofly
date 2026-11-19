@@ -3,7 +3,6 @@
 // Proofly — Phase 5
 // ─────────────────────────────────────────────
 
-import { db, isFirebaseConfigured } from '../config/firebase';
 import { sanitizeFirestoreData } from '../utils/firestoreUtils';
 import {
   collection,
@@ -11,9 +10,18 @@ import {
   setDoc,
   getDoc,
   getDocs,
+  limit,
   query,
   where,
 } from 'firebase/firestore';
+import {
+  clampPageSize,
+  mapFirestoreError,
+  resolveFirestore,
+  withServerTimestamps,
+  type FirestoreExecutionOptions,
+  type PaginationOptions,
+} from './firestorePersistenceService';
 import type { TeamRecord, ParticipantRecord } from '../types/submission';
 
 export interface CsvImportRow {
@@ -294,87 +302,112 @@ export class ParticipantTeamService {
     };
   }
 
-  public async getTeam(teamId: string): Promise<TeamRecord | null> {
-    if (this.memTeams.has(teamId)) {
-      return this.memTeams.get(teamId)!;
-    }
-    if (isFirebaseConfigured() && db) {
+  public async getTeam(
+    teamId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<TeamRecord | null> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        const snap = await getDoc(doc(db, 'teams', teamId));
-        if (snap.exists()) {
-          return snap.data() as TeamRecord;
-        }
-      } catch {
-        // fallback
+        const snap = await getDoc(doc(fs, 'teams', teamId));
+        return snap.exists() ? (snap.data() as TeamRecord) : null;
+      } catch (err) {
+        throw mapFirestoreError(err, 'getTeam', 'teams');
       }
     }
-    return null;
+    return this.memTeams.get(teamId) || null;
   }
 
-  public async listCompetitionTeams(competitionId: string): Promise<TeamRecord[]> {
+  public async listCompetitionTeams(
+    competitionId: string,
+    options?: PaginationOptions
+  ): Promise<TeamRecord[]> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      const pageSize = clampPageSize(options?.pageSize);
+      try {
+        const q = query(
+          collection(fs, 'teams'),
+          where('competitionId', '==', competitionId),
+          limit(pageSize)
+        );
+        const snaps = await getDocs(q);
+        return snaps.docs.map((d) => d.data() as TeamRecord);
+      } catch (err) {
+        throw mapFirestoreError(err, 'listCompetitionTeams', 'teams');
+      }
+    }
+
     const list: TeamRecord[] = [];
     for (const t of this.memTeams.values()) {
       if (t.competitionId === competitionId) list.push(t);
     }
-    if (isFirebaseConfigured() && db) {
-      try {
-        const q = query(collection(db, 'teams'), where('competitionId', '==', competitionId));
-        const snaps = await getDocs(q);
-        snaps.forEach((docSnap) => {
-          const item = docSnap.data() as TeamRecord;
-          if (!list.some((existing) => existing.id === item.id)) {
-            list.push(item);
-          }
-        });
-      } catch {
-        // fallback
-      }
-    }
     return list;
   }
 
-  public async listCompetitionParticipants(competitionId: string): Promise<ParticipantRecord[]> {
+  public async listCompetitionParticipants(
+    competitionId: string,
+    options?: PaginationOptions
+  ): Promise<ParticipantRecord[]> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      const pageSize = clampPageSize(options?.pageSize);
+      try {
+        const q = query(
+          collection(fs, 'participants'),
+          where('competitionId', '==', competitionId),
+          limit(pageSize)
+        );
+        const snaps = await getDocs(q);
+        return snaps.docs.map((d) => d.data() as ParticipantRecord);
+      } catch (err) {
+        throw mapFirestoreError(err, 'listCompetitionParticipants', 'participants');
+      }
+    }
+
     const list: ParticipantRecord[] = [];
     for (const p of this.memParticipants.values()) {
       if (p.competitionId === competitionId) list.push(p);
     }
-    if (isFirebaseConfigured() && db) {
-      try {
-        const q = query(collection(db, 'participants'), where('competitionId', '==', competitionId));
-        const snaps = await getDocs(q);
-        snaps.forEach((docSnap) => {
-          const item = docSnap.data() as ParticipantRecord;
-          if (!list.some((existing) => existing.id === item.id)) {
-            list.push(item);
-          }
-        });
-      } catch {
-        // fallback
-      }
-    }
     return list;
   }
 
-  public async saveTeam(team: TeamRecord): Promise<void> {
-    this.memTeams.set(team.id, team);
-    if (isFirebaseConfigured() && db) {
+  public async saveTeam(
+    team: TeamRecord,
+    options?: FirestoreExecutionOptions
+  ): Promise<void> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await setDoc(doc(db, 'teams', team.id), sanitizeFirestoreData(team));
-      } catch {
-        // memory fallback
+        await setDoc(
+          doc(fs, 'teams', team.id),
+          withServerTimestamps(sanitizeFirestoreData(team), true)
+        );
+        return;
+      } catch (err) {
+        throw mapFirestoreError(err, 'saveTeam', 'teams');
       }
     }
+    this.memTeams.set(team.id, team);
   }
 
-  public async saveParticipant(participant: ParticipantRecord): Promise<void> {
-    this.memParticipants.set(participant.id, participant);
-    if (isFirebaseConfigured() && db) {
+  public async saveParticipant(
+    participant: ParticipantRecord,
+    options?: FirestoreExecutionOptions
+  ): Promise<void> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await setDoc(doc(db, 'participants', participant.id), sanitizeFirestoreData(participant));
-      } catch {
-        // memory fallback
+        await setDoc(
+          doc(fs, 'participants', participant.id),
+          withServerTimestamps(sanitizeFirestoreData(participant), true)
+        );
+        return;
+      } catch (err) {
+        throw mapFirestoreError(err, 'saveParticipant', 'participants');
       }
     }
+    this.memParticipants.set(participant.id, participant);
   }
 
   public clearMemoryStore(): void {

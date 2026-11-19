@@ -43,6 +43,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
     <Modal
       isOpen={isOpen}
       onClose={handleClose}
+      title={title}
       maxWidth="md"
       footer={
         <>
@@ -60,19 +61,18 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
         </>
       }
     >
-      <div className="flex items-start gap-4">
+      <div className="flex items-start gap-3.5">
         <div
-          className={`p-2.5 rounded-full shrink-0 ${
+          className={`p-2 rounded-full shrink-0 ${
             variant === 'danger'
               ? 'bg-rose-50 text-rose-600 dark:bg-rose-500/15 dark:text-rose-400'
               : 'bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400'
           }`}
         >
-          {variant === 'danger' ? <AlertTriangle size={22} /> : <Info size={22} />}
+          {variant === 'danger' ? <AlertTriangle size={20} /> : <Info size={20} />}
         </div>
-        <div className="space-y-1.5">
-          <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">{title}</h4>
-          <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">{resolvedDesc}</p>
+        <div className="space-y-1">
+          <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">{resolvedDesc}</p>
         </div>
       </div>
     </Modal>

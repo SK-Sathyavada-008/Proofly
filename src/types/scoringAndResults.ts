@@ -8,6 +8,8 @@ import type { JudgeWorkloadSummary } from './judgeAndEvaluation';
 export type AggregationPolicyType =
   | 'AVERAGE_JUDGE'
   | 'WEIGHTED_JUDGE'
+  | 'MEDIAN'
+  | 'TRIMMED_MEAN'
   | 'AI_ASSISTED'
   | 'CRITERION_WEIGHTED'
   | 'ROUND_WISE';
@@ -28,6 +30,7 @@ export interface TieBreakerRule {
 }
 
 export interface CompetitionScoringPolicy {
+  organizationId?: string;
   competitionId: string;
   policyType: AggregationPolicyType;
   /**
@@ -58,14 +61,18 @@ export type ScoreContributionSource = 'AI' | 'HUMAN';
 export interface ScoreLedgerEntry {
   readonly id: string;
   readonly sequenceNumber: number;
+  readonly organizationId?: string;
   readonly competitionId: string;
   readonly entryId: string; // submissionId
   readonly referenceId?: string;
   readonly evaluationId: string;
+  readonly runId?: string;
+  readonly rubricVersion?: number;
   readonly criterionId: string;
   readonly criterionName?: string;
   readonly score: number;
   readonly maxScore: number;
+  readonly previousScore?: number;
   readonly source: ScoreContributionSource;
   readonly actorId: string;
   readonly actorName: string;
@@ -127,10 +134,12 @@ export interface RankedEntry {
 
 export interface ResultPublicationRecord {
   id: string;
+  organizationId?: string;
   competitionId: string;
   competitionTitle: string;
   publicSlug: string;
   status: ResultPublicationStatus;
+  isPublic?: boolean;
   version: number;
   policySnapshot: CompetitionScoringPolicy;
   entries: RankedEntry[];
@@ -217,6 +226,7 @@ export type GovernanceAuditCategory =
 export interface GovernanceAuditEvent {
   readonly id: string;
   readonly sequenceNumber: number;
+  readonly organizationId?: string;
   readonly competitionId: string;
   readonly category: GovernanceAuditCategory;
   readonly action: string;

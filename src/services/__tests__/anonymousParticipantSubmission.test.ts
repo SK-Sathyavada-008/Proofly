@@ -150,7 +150,7 @@ describe('Phase 5: Anonymous Participant Submissions', () => {
         primaryContactEmail: 'crypto@example.com',
         participants: [{ name: 'Cryptographer', isLead: true }],
         projectTitle: 'Zero Knowledge Token Proof',
-        projectDescription: 'Security verification demonstration project.',
+        projectDescription: 'Security verification demonstration project with zero knowledge token hash guarantees.',
         githubUrl: 'https://github.com/sk-sathyavada-008/zk-proof',
         fieldValues: {},
       };
@@ -195,7 +195,7 @@ describe('Phase 5: Anonymous Participant Submissions', () => {
         primaryContactEmail: 'solo@example.com',
         participants: [{ name: 'Solo Researcher', email: 'solo@example.com', role: 'Solo Creator', isLead: true }],
         projectTitle: 'Independent AI Agent Study',
-        projectDescription: 'Empirical analysis of on-device LLMs.',
+        projectDescription: 'Empirical analysis of on-device LLMs and decentralized hybrid model evaluation.',
         githubUrl: 'https://github.com/sk-sathyavada-008/solo-study',
         fieldValues: {},
       };
@@ -322,8 +322,9 @@ Beta Squad,Chell Lab,chell@example.com,Robotics,chell,true
         sessionToken: validSessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'Tester',
+        primaryContactEmail: 'tester@example.com',
         projectTitle: 'Gatekeeper Check',
-        projectDescription: 'Check that judges cannot view un-evaluated submissions.',
+        projectDescription: 'Check that judges cannot view un-evaluated submissions before AI completion.',
         githubUrl: 'https://github.com/sk-sathyavada-008/gatekeeper',
         fieldValues: {},
       };
@@ -368,8 +369,9 @@ Beta Squad,Chell Lab,chell@example.com,Robotics,chell,true
         sessionToken: validSessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'Tester',
+        primaryContactEmail: 'tester@example.com',
         projectTitle: 'Failure Override Project',
-        projectDescription: 'Simulate AI failure and organizer manual override.',
+        projectDescription: 'Simulate AI failure and organizer manual override with documented justification notes.',
         githubUrl: 'https://github.com/sk-sathyavada-008/override-test',
         fieldValues: {},
       };
@@ -432,6 +434,7 @@ Beta Squad,Chell Lab,chell@example.com,Robotics,chell,true
         sessionToken: validSessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'Versioner',
+        primaryContactEmail: 'versioner@example.com',
         projectTitle: 'Initial Title v1',
         projectDescription: 'Initial comprehensive project description for version 1 submission.',
         githubUrl: 'https://github.com/sk-sathyavada-008/v1-repo',
@@ -447,7 +450,7 @@ Beta Squad,Chell Lab,chell@example.com,Robotics,chell,true
         rawToken: result.rawManagementToken,
         updatedPayload: {
           projectTitle: 'Refined Title v2',
-          projectDescription: 'Updated and expanded description v2.',
+          projectDescription: 'Updated and expanded description v2 with architectural diagrams and benchmarks.',
         },
         changeSummary: 'Expanded problem statement and added architectural diagrams.',
         mockCompetition,
@@ -469,8 +472,10 @@ Beta Squad,Chell Lab,chell@example.com,Robotics,chell,true
         sessionToken: validSessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'Participant A',
+        primaryContactEmail: 'participanta@example.com',
         projectTitle: 'Project A',
-        projectDescription: 'Project A description.',
+        projectDescription: 'Project A comprehensive description detailing architecture and implementation.',
+        githubUrl: 'https://github.com/sk-sathyavada-008/project-a',
         fieldValues: {},
       };
 
@@ -508,6 +513,7 @@ Beta Squad,Chell Lab,chell@example.com,Robotics,chell,true
         sessionToken: validSessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'Locked Submitter',
+        primaryContactEmail: 'locked@example.com',
         projectTitle: 'No Edits Allowed',
         projectDescription: 'Comprehensive description for a submission that cannot be edited afterwards.',
         githubUrl: 'https://github.com/sk-sathyavada-008/no-edits',
@@ -532,6 +538,7 @@ Beta Squad,Chell Lab,chell@example.com,Robotics,chell,true
         sessionToken: validSessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'Drafter',
+        primaryContactEmail: 'drafter@example.com',
         projectTitle: 'Work in Progress',
         projectDescription: 'Incomplete project description...',
         fieldValues: {},
@@ -578,8 +585,10 @@ Beta Squad,Chell Lab,chell@example.com,Robotics,chell,true
         sessionToken: validSessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'Late Submitter',
+        primaryContactEmail: 'late@example.com',
         projectTitle: 'Too Late',
-        projectDescription: 'Attempting to submit after deadline.',
+        projectDescription: 'Attempting to submit after deadline with complete architectural documentation.',
+        githubUrl: 'https://github.com/sk-sathyavada-008/too-late',
         fieldValues: {},
       };
 
@@ -603,8 +612,9 @@ Beta Squad,Chell Lab,chell@example.com,Robotics,chell,true
         sessionToken: validSessionToken,
         submissionType: 'INDIVIDUAL',
         primaryContactName: 'Grace Period Submitter',
+        primaryContactEmail: 'grace@example.com',
         projectTitle: 'Accepted Late Project',
-        projectDescription: 'Submitted during grace period.',
+        projectDescription: 'Submitted during grace period with full architectural documentation.',
         githubUrl: 'https://github.com/sk-sathyavada-008/grace-period',
         fieldValues: {},
       };

@@ -63,17 +63,36 @@ export interface TeamRecord {
   updatedAt: string;
 }
 
+export type FileUploadStatus =
+  | 'PENDING'
+  | 'UPLOADING'
+  | 'UPLOADED'
+  | 'FAILED'
+  | 'CANCELLED'
+  | 'REUPLOAD_REQUIRED';
+
+export type StorageBackendType = 'firestore-chunks' | 'firebase-storage';
+
 export interface StoredFileMetadata {
   id: string;
   fieldId: string;
-  fileName: string;
+  originalFileName?: string;
+  fileName: string; // Sanitized filename
   fileSize: number; // in bytes
   mimeType: string;
   detectedMimeType?: string;
-  storagePath: string;
+  storagePath: string; // Canonical: organizations/{orgId}/competitions/{compId}/submissions/{subId}/{fileId}_{sanitizedName}
+  storageBackend?: StorageBackendType; // 'firestore-chunks' (Spark free tier default) | 'firebase-storage' (Blaze bucket)
+  chunkCount?: number; // Populated for 'firestore-chunks' binary chunk artifacts
+  /** Empty for private artifacts (never persist blob: URLs or permanent public URLs). */
   downloadUrl: string;
   uploadedAt: string;
-  checksum?: string;
+  uploadedBy?: string; // Authenticated UID or scoped participant session identifier
+  organizationId?: string;
+  competitionId?: string;
+  submissionId?: string;
+  uploadStatus?: FileUploadStatus;
+  checksum?: string; // Full-file SHA-256 hex digest
   isVerified: boolean;
 }
 
@@ -105,6 +124,7 @@ export interface ProjectSubmission {
   // Access Attribution
   accessKeyId?: string;
   sessionTokenId?: string;
+  participantSessionId?: string;
   
   // Submission Type & Team
   submissionType: SubmissionType;

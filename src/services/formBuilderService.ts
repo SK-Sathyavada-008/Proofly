@@ -7,17 +7,26 @@ import {
   collection,
   doc,
   getDocs,
+  limit,
   setDoc,
   deleteDoc,
   query,
   where,
 } from 'firebase/firestore';
-import { db, isFirebaseConfigured } from '../config/firebase';
 import { sanitizeFirestoreData } from '../utils/firestoreUtils';
+import {
+  clampPageSize,
+  mapFirestoreError,
+  resolveFirestore,
+  withServerTimestamps,
+  type FirestoreExecutionOptions,
+  type PaginationOptions,
+} from './firestorePersistenceService';
 import type {
   SubmissionFormSchema,
   SubmissionFormField,
 } from '../types/formAndAccess';
+import { competitionService } from './competitionService';
 
 /**
  * Standard Default Hackathon Form Fields.
@@ -278,39 +287,13 @@ export const DEFAULT_RESEARCH_FIELDS: SubmissionFormField[] = [
   },
 ];
 
-const FORM_SCHEMAS_STORAGE_KEY = 'proofly_form_schemas_v1';
-
+// Unit-test-only in-memory store (unused whenever Firestore is active)
 let localFormSchemas: SubmissionFormSchema[] = [];
-
-function loadFormSchemasFromStorage(): void {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    const raw = window.localStorage.getItem(FORM_SCHEMAS_STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        localFormSchemas = parsed;
-      }
-    }
-  } catch {
-    // Ignore storage errors
-  }
-}
-
-function saveFormSchemasToStorage(): void {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    window.localStorage.setItem(FORM_SCHEMAS_STORAGE_KEY, JSON.stringify(localFormSchemas));
-  } catch {
-    // Ignore storage errors
-  }
-}
-
-loadFormSchemasFromStorage();
 
 export const formBuilderService = {
   /**
-   * Creates or overwrites a form schema for a competition (and optional round).
+   * Creates or overwrites a form schema for a competition (and optional round) durably in Firestore.
+   * Throws PersistenceError on Firestore failure (zero silent local fallback).
    */
   async saveFormSchema(
     competitionIdOrSchema: string | SubmissionFormSchema,
@@ -318,8 +301,11 @@ export const formBuilderService = {
     fields?: SubmissionFormField[],
     roundId?: string,
     description?: string,
-    existingSchemaId?: string
+    existingSchemaId?: string,
+    options?: FirestoreExecutionOptions
   ): Promise<SubmissionFormSchema> {
+    const fs = resolveFirestore(options?.firestore);
+
     if (typeof competitionIdOrSchema === 'object') {
       const s = competitionIdOrSchema;
       const schemaId = s.id || `schema-${Math.random().toString(36).substring(2, 9)}`;
@@ -335,20 +321,30 @@ export const formBuilderService = {
         updatedAt: now,
       };
 
-      if (isFirebaseConfigured() && db) {
+      if (fs) {
         try {
-          await setDoc(doc(db, 'formSchemas', schemaId), sanitizeFirestoreData(schema));
-        } catch {
-          // Fallback to local store
+          if (!schema.organizationId) {
+            const comp = await competitionService.getCompetition(schema.competitionId);
+            if (comp?.organizationId) {
+              schema.organizationId = comp.organizationId;
+            }
+          }
+          await setDoc(
+            doc(fs, 'formSchemas', schemaId),
+            withServerTimestamps(sanitizeFirestoreData(schema), true)
+          );
+          return schema;
+        } catch (err) {
+          throw mapFirestoreError(err, 'saveFormSchema', 'formSchemas');
         }
       }
+
       const existingIdx = localFormSchemas.findIndex((f) => f.id === schemaId);
       if (existingIdx !== -1) {
         localFormSchemas[existingIdx] = schema;
       } else {
         localFormSchemas.push(schema);
       }
-      saveFormSchemasToStorage();
       return schema;
     }
 
@@ -356,7 +352,6 @@ export const formBuilderService = {
     const schemaId = existingSchemaId || `schema-${Math.random().toString(36).substring(2, 9)}`;
     const now = new Date().toISOString();
 
-    // Ensure sorted order
     const orderedFields = (fields || []).map((f, idx) => ({
       ...f,
       order: f.order ?? idx + 1,
@@ -373,11 +368,28 @@ export const formBuilderService = {
       updatedAt: now,
     };
 
-    if (isFirebaseConfigured() && db) {
+    if (fs) {
       try {
-        await setDoc(doc(db, 'formSchemas', schemaId), sanitizeFirestoreData(schema));
-      } catch {
-        // Fallback to local store
+        let orgId: string | undefined = undefined;
+        try {
+          const comp = await competitionService.getCompetition(competitionId);
+          if (comp?.organizationId) {
+            orgId = comp.organizationId;
+          }
+        } catch {
+          // non-fatal if offline/unresolved
+        }
+        if (orgId) {
+          schema.organizationId = orgId;
+        }
+
+        await setDoc(
+          doc(fs, 'formSchemas', schemaId),
+          withServerTimestamps(sanitizeFirestoreData(schema), true)
+        );
+        return schema;
+      } catch (err) {
+        throw mapFirestoreError(err, 'saveFormSchema', 'formSchemas');
       }
     }
 
@@ -387,36 +399,40 @@ export const formBuilderService = {
     } else {
       localFormSchemas.push(schema);
     }
-    saveFormSchemasToStorage();
 
     return schema;
   },
 
-  /**
-   * Retrieves the form schema for a competition, optionally specific to a round.
-   * If none exists, initializes and returns the default hackathon form.
-   */
-  async getFormSchema(competitionId: string, roundId?: string): Promise<SubmissionFormSchema> {
-    if (isFirebaseConfigured() && db) {
+  async getFormSchema(
+    competitionId: string,
+    roundId?: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<SubmissionFormSchema> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        let q = query(collection(db, 'formSchemas'), where('competitionId', '==', competitionId));
-        if (roundId) {
-          q = query(
-            collection(db, 'formSchemas'),
-            where('competitionId', '==', competitionId),
-            where('roundId', '==', roundId)
-          );
-        }
+        const q = roundId
+          ? query(
+              collection(fs, 'formSchemas'),
+              where('competitionId', '==', competitionId),
+              where('roundId', '==', roundId),
+              limit(1)
+            )
+          : query(
+              collection(fs, 'formSchemas'),
+              where('competitionId', '==', competitionId),
+              limit(1)
+            );
         const snap = await getDocs(q);
         if (!snap.empty) {
           return snap.docs[0].data() as SubmissionFormSchema;
         }
-      } catch {
-        // Fallback to local store
+        return this.generateDefaultHackathonSchema(competitionId);
+      } catch (err) {
+        throw mapFirestoreError(err, 'getFormSchema', 'formSchemas');
       }
     }
 
-    // Check local store
     const local = localFormSchemas.find(
       (s) => s.competitionId === competitionId && (!roundId || s.roundId === roundId)
     );
@@ -424,7 +440,6 @@ export const formBuilderService = {
       return local;
     }
 
-    // Default Fallback
     const fallback: SubmissionFormSchema = {
       id: `schema-default-${competitionId}`,
       competitionId,
@@ -436,23 +451,26 @@ export const formBuilderService = {
       updatedAt: new Date().toISOString(),
     };
     localFormSchemas.push(fallback);
-    saveFormSchemasToStorage();
     return fallback;
   },
 
-  /**
-   * Lists all form schemas for a competition (e.g. across multiple rounds).
-   */
-  async listFormSchemasForCompetition(competitionId: string): Promise<SubmissionFormSchema[]> {
-    if (isFirebaseConfigured() && db) {
+  async listFormSchemasForCompetition(
+    competitionId: string,
+    options?: PaginationOptions
+  ): Promise<SubmissionFormSchema[]> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      const pageSize = clampPageSize(options?.pageSize);
       try {
-        const q = query(collection(db, 'formSchemas'), where('competitionId', '==', competitionId));
+        const q = query(
+          collection(fs, 'formSchemas'),
+          where('competitionId', '==', competitionId),
+          limit(pageSize)
+        );
         const snap = await getDocs(q);
-        if (!snap.empty) {
-          return snap.docs.map((d) => d.data() as SubmissionFormSchema);
-        }
-      } catch {
-        // Fallback to local store
+        return snap.docs.map((d) => d.data() as SubmissionFormSchema);
+      } catch (err) {
+        throw mapFirestoreError(err, 'listFormSchemasForCompetition', 'formSchemas');
       }
     }
     const matching = localFormSchemas.filter((s) => s.competitionId === competitionId);
@@ -462,19 +480,20 @@ export const formBuilderService = {
     return matching;
   },
 
-  /**
-   * Deletes a form schema.
-   */
-  async deleteFormSchema(schemaId: string): Promise<void> {
-    if (isFirebaseConfigured() && db) {
+  async deleteFormSchema(
+    schemaId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<void> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        await deleteDoc(doc(db, 'formSchemas', schemaId));
-      } catch {
-        // Fallback to local store
+        await deleteDoc(doc(fs, 'formSchemas', schemaId));
+        return;
+      } catch (err) {
+        throw mapFirestoreError(err, 'deleteFormSchema', 'formSchemas');
       }
     }
     localFormSchemas = localFormSchemas.filter((s) => s.id !== schemaId);
-    saveFormSchemasToStorage();
   },
 
   generateDefaultHackathonSchema(competitionId: string, _organizationId?: string): SubmissionFormSchema {

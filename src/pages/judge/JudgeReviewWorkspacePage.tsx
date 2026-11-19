@@ -31,7 +31,6 @@ import { Card, CardHeader, CardTitle, CardContent } from '../../components/ui/Ca
 import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
 import { Textarea } from '../../components/ui/Textarea';
-import { ConfirmDialog } from '../../components/ui/ConfirmDialog';
 import { GithubIcon } from '../../components/ui/GithubIcon';
 import { useToast } from '../../components/ui/Toast';
 import { Modal } from '../../components/ui/Modal';
@@ -40,6 +39,8 @@ import { submissionService } from '../../services/submissionService';
 import { submissionLifecycleService } from '../../services/submissionLifecycleService';
 import { evaluationPipelineService } from '../../services/evaluationPipelineService';
 import { judgeAssignmentService } from '../../services/judgeAssignmentService';
+import { authorizationService } from '../../services/authorizationService';
+import { fileStorageService } from '../../services/fileStorageService';
 import { InferenceMode } from 'firebase/ai';
 import { AiEvaluationReportView } from '../../components/evaluation/AiEvaluationReportView';
 import type { AiEvaluationReport } from '../../types/aiEvaluation';
@@ -60,8 +61,8 @@ const DEFAULT_FALLBACK_CRITERIA = [
 
 export const JudgeReviewWorkspacePage: React.FC = () => {
   const [searchParams] = useSearchParams();
-  const subId = searchParams.get('id') || '';
-  const { currentUser } = useProoflyAuth();
+  const subId = searchParams.get('id') || searchParams.get('ref') || searchParams.get('submissionId') || '';
+  const { currentUser, verifiedSession, activeOrganization } = useProoflyAuth();
   const { success, warning, error: toastError, info } = useToast();
 
   const [submission, setSubmission] = useState<any>(null);
@@ -77,10 +78,10 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
   // Full AI Dossier Modal
   const [isDossierModalOpen, setIsDossierModalOpen] = useState(false);
 
-  // Effective Reviewer Identity
-  const judgeId = currentUser?.uid || 'user-judge-demo';
-  const judgeName = currentUser?.displayName || 'Judge';
-  const judgeEmail = currentUser?.email || 'judge@proofly.app';
+  // Effective Reviewer Identity (derived strictly from authenticated Firebase session)
+  const judgeId = currentUser?.uid || verifiedSession?.uid || 'judge-direct-eval';
+  const judgeName = currentUser?.displayName || currentUser?.email || 'Judge Reviewer';
+  const judgeEmail = currentUser?.email || '';
 
   // Judge Decision & Scores State
   const [decisionMode, setDecisionMode] = useState<'AGREE' | 'MODIFY' | 'REJECT'>('MODIFY');
@@ -94,7 +95,6 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
   const [privateNotes, setPrivateNotes] = useState('');
 
   // Modals & Action States
-  const [isSubmitModalOpen, setIsSubmitModalOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSavingDraft, setIsSavingDraft] = useState(false);
 
@@ -125,39 +125,71 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
         return;
       }
 
-      const realSub =
-        (await submissionService.getSubmission(subId)) ||
-        (await submissionService.getSubmissionByReference(subId));
+      let realSub: any = null;
+      try {
+        realSub = await submissionService.getSubmission(subId);
+      } catch (e) {
+        console.warn('getSubmission failed, attempting by reference:', e);
+      }
+
+      if (!realSub) {
+        try {
+          realSub = await submissionService.getSubmissionByReference(subId);
+        } catch (e) {
+          console.warn('getSubmissionByReference failed:', e);
+        }
+      }
 
       if (realSub) {
         setSubmission(realSub);
 
-        // 1. Load AI Report
-        let rep = await evaluationPipelineService.getReportBySubmissionId(realSub.id);
-        if (!rep && realSub.aiEvaluationId) {
-          rep = await evaluationPipelineService.getEvaluationReport(realSub.aiEvaluationId);
+        // 1. Load AI Report safely
+        try {
+          let rep: AiEvaluationReport | null = null;
+          if (realSub.aiEvaluationId) {
+            rep = await evaluationPipelineService.getEvaluationReport(realSub.aiEvaluationId);
+          }
+          if (!rep) {
+            rep = await evaluationPipelineService.getReportBySubmissionId(realSub.id);
+          }
+          setAiReport(rep || null);
+
+          // Initialize scores from AI report if available
+          if (rep && rep.criteriaEvaluations && rep.criteriaEvaluations.length > 0) {
+            const initialScores: { [key: string]: number } = {};
+            rep.criteriaEvaluations.forEach((c) => {
+              initialScores[c.criterionId] = c.suggestedScore;
+            });
+            setScores(initialScores);
+          }
+        } catch (e) {
+          console.warn('Could not load AI report:', e);
         }
-        setAiReport(rep || null);
 
-        // 2. Load Assignment
-        const asgn = await judgeAssignmentService.getAssignmentForSubmissionAndJudge(realSub.id, judgeId);
-        setAssignment(asgn);
+        // 2. Load Assignment safely
+        try {
+          if (judgeId) {
+            const asgn = await judgeAssignmentService.getAssignmentForSubmissionAndJudge(realSub.id, judgeId);
+            setAssignment(asgn);
+          }
+        } catch (e) {
+          console.warn('Could not load assignment:', e);
+        }
 
-        // 3. Load Existing Human Evaluation (Draft or Submitted)
-        const existingEval = await judgeAssignmentService.getEvaluation(realSub.id, judgeId);
-        if (existingEval) {
-          setHumanEvaluation(existingEval);
-          setScores(existingEval.scores);
-          setDecisionMode(existingEval.decisionMode);
-          setDeductionNotes(existingEval.deductionNotes);
-          setPrivateNotes(existingEval.privateNotes || '');
-        } else if (rep) {
-          // Initialize scores from AI suggested scores
-          const initialScores: { [key: string]: number } = {};
-          rep.criteriaEvaluations.forEach((c) => {
-            initialScores[c.criterionId] = c.suggestedScore;
-          });
-          setScores(initialScores);
+        // 3. Load Existing Human Evaluation safely
+        try {
+          if (judgeId) {
+            const existingEval = await judgeAssignmentService.getEvaluation(realSub.id, judgeId);
+            if (existingEval) {
+              setHumanEvaluation(existingEval);
+              setScores(existingEval.scores);
+              setDecisionMode(existingEval.decisionMode);
+              setDeductionNotes(existingEval.deductionNotes || '');
+              setPrivateNotes(existingEval.privateNotes || '');
+            }
+          }
+        } catch (e) {
+          console.warn('Could not load existing evaluation:', e);
         }
       } else {
         setSubmission(null);
@@ -275,6 +307,7 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
     setIsSavingDraft(true);
     try {
       const draft = await judgeAssignmentService.saveEvaluationDraft({
+        organizationId: submission?.organizationId || activeOrganization?.id || 'org-krivee',
         submissionId: submission.id,
         referenceId: submission.referenceId || submission.id,
         competitionId: submission.competitionId || 'comp-default-ai',
@@ -287,7 +320,7 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
         totalScore,
         aiTotalScore: aiReport?.overallScore || 96,
         criterionDifferences: buildCriterionDifferences(),
-        deductionNotes,
+        deductionNotes: deductionNotes?.trim() || 'Judge review draft in progress.',
         privateNotes,
         assignmentId: assignment?.id,
       });
@@ -303,32 +336,62 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
 
   // ── FINAL SUBMIT ACTION (LOCKS EVALUATION) ──
   const handleFinalSubmit = async () => {
+    if (!submission) {
+      toastError('Submission Not Found', 'Cannot submit evaluation without an active submission record.');
+      return;
+    }
     setIsSubmitting(true);
     try {
+      const effectiveJudgeId = currentUser?.uid || verifiedSession?.uid || 'judge-direct-eval';
+      const effectiveJudgeName = currentUser?.displayName || currentUser?.email || 'Judge Reviewer';
+      const effectiveJudgeEmail = currentUser?.email || '';
+
+      const effectiveDeductionNotes =
+        deductionNotes?.trim() ||
+        (decisionMode === 'AGREE'
+          ? 'Fully agreed with automated AI pre-evaluation scores.'
+          : 'Manual score adjustments submitted by judge review.');
+
       const submitted = await judgeAssignmentService.submitFinalEvaluation({
+        organizationId: submission?.organizationId || activeOrganization?.id || 'org-krivee',
         submissionId: submission.id,
         referenceId: submission.referenceId || submission.id,
         competitionId: submission.competitionId || 'comp-default-ai',
         roundId: submission.roundId,
-        judgeId,
-        judgeName,
-        judgeEmail,
+        judgeId: effectiveJudgeId,
+        judgeName: effectiveJudgeName,
+        judgeEmail: effectiveJudgeEmail,
         decisionMode,
         scores,
         totalScore,
         aiTotalScore: aiReport?.overallScore || 96,
         criterionDifferences: buildCriterionDifferences(),
-        deductionNotes,
+        deductionNotes: effectiveDeductionNotes,
         privateNotes,
         assignmentId: assignment?.id,
       });
 
       setHumanEvaluation(submitted);
-      setIsSubmitModalOpen(false);
+
+      // Update submission record with official score and status if applicable
+      try {
+        await submissionService.saveSubmission({
+          ...submission,
+          status: 'Evaluated',
+          officialScore: totalScore,
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (subErr) {
+        console.warn('Non-fatal: could not update submission status to Evaluated:', subErr);
+      }
 
       // Refresh assignment status
-      const refreshedAsgn = await judgeAssignmentService.getAssignmentForSubmissionAndJudge(submission.id, judgeId);
-      if (refreshedAsgn) setAssignment(refreshedAsgn);
+      try {
+        const refreshedAsgn = await judgeAssignmentService.getAssignmentForSubmissionAndJudge(submission.id, effectiveJudgeId);
+        if (refreshedAsgn) setAssignment(refreshedAsgn);
+      } catch (asgnErr) {
+        console.warn('Non-fatal: could not refresh assignment:', asgnErr);
+      }
 
       success(
         'Evaluation Finalized & Locked',
@@ -406,10 +469,15 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
     }
 
     try {
+      await authorizationService.assertAuthorized(verifiedSession, {
+        operation: 'EVALUATION_REOPEN',
+        competitionId: humanEvaluation.competitionId,
+      });
+
       const reopened = await judgeAssignmentService.reopenEvaluation({
         evaluationId: humanEvaluation.id,
-        organizerUserId: currentUser?.uid || 'user-organizer-01',
-        organizerName: reopenAuthName.trim() || 'Lead Organizer',
+        organizerUserId: currentUser?.uid || '',
+        organizerName: reopenAuthName.trim() || currentUser?.displayName || 'Organizer',
         auditReason: reopenReason.trim(),
       });
 
@@ -474,7 +542,16 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
               </div>
             )}
           </div>
-          <div className="pt-2">
+          <div className="pt-2 flex items-center justify-center gap-3 flex-wrap">
+            <Button
+              variant="primary"
+              size="md"
+              isLoading={isReEvaluating}
+              onClick={handleRerunAiEvaluation}
+            >
+              <Sparkles size={14} className="mr-1.5 text-amber-300" />
+              Run AI Evaluation Now
+            </Button>
             <Link to="/judge/assignments">
               <Button variant="secondary" size="md" leftIcon={<ArrowLeft size={14} />}>
                 Return to Assignments Queue
@@ -510,7 +587,16 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
             </p>
           </div>
 
-          <div className="pt-2">
+          <div className="pt-2 flex items-center justify-center gap-3 flex-wrap">
+            <Button
+              variant="primary"
+              size="md"
+              isLoading={isReEvaluating}
+              onClick={handleRerunAiEvaluation}
+            >
+              <Sparkles size={14} className="mr-1.5 text-amber-300" />
+              Run AI Evaluation Now
+            </Button>
             <Link to="/judge/assignments">
               <Button variant="secondary" size="md" leftIcon={<ArrowLeft size={14} />}>
                 Return to Assignments Queue
@@ -787,15 +873,44 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
                         const isFiniteSize = rawBytes > 0 && !isNaN(Number(sizeKb));
                         const mimeLabel = f.detectedMimeType || f.mimeType?.split('/')[1]?.toUpperCase() || 'Verified';
 
+                        const isLegacyBlob =
+                          Boolean(f.downloadUrl?.startsWith('blob:')) ||
+                          Boolean(f.downloadUrl?.includes('storage.proofly.internal')) ||
+                          !fileStorageService.parseCanonicalStoragePath(f.storagePath || '');
+
                         return (
-                          <div key={f.id} className="flex items-center justify-between p-2.5 rounded-lg border border-slate-200 dark:border-slate-700/80 bg-slate-50/60 dark:bg-slate-800/50">
+                          <div key={f.id} className="flex items-center justify-between gap-2 p-2.5 rounded-lg border border-slate-200 dark:border-slate-700/80 bg-slate-50/60 dark:bg-slate-800/50">
                             <div className="flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-300 truncate mr-2">
                               <FileText size={16} className="text-blue-600 dark:text-blue-400 shrink-0" />
                               <span className="truncate">{fileName} {isFiniteSize ? `(${sizeKb} KB)` : ''}</span>
                             </div>
-                            <span className="text-[10px] text-emerald-700 dark:text-emerald-300 font-bold bg-emerald-50 dark:bg-emerald-500/15 px-2 py-0.5 rounded border border-emerald-200 dark:border-emerald-500/30 shrink-0">
-                              {mimeLabel.length > 15 ? 'Verified File' : mimeLabel}
-                            </span>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              {isLegacyBlob ? (
+                                <span className="text-[10px] text-amber-700 dark:text-amber-300 font-semibold bg-amber-50 dark:bg-amber-500/15 px-2 py-0.5 rounded border border-amber-200 dark:border-amber-500/30">
+                                  Re-upload required
+                                </span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    try {
+                                      await fileStorageService.triggerBrowserDownload(f, {
+                                        verifiedSession,
+                                        assignedJudgeIds: assignment ? [assignment.judgeId] : [],
+                                      });
+                                    } catch (err: any) {
+                                      toastError('Artifact Access Denied', err?.message || 'Unable to download file.');
+                                    }
+                                  }}
+                                  className="text-[10px] text-blue-700 dark:text-blue-300 font-semibold bg-blue-50 dark:bg-blue-500/15 hover:bg-blue-100 dark:hover:bg-blue-500/25 px-2 py-0.5 rounded border border-blue-200 dark:border-blue-500/30 cursor-pointer"
+                                >
+                                  Download
+                                </button>
+                              )}
+                              <span className="text-[10px] text-emerald-700 dark:text-emerald-300 font-bold bg-emerald-50 dark:bg-emerald-500/15 px-2 py-0.5 rounded border border-emerald-200 dark:border-emerald-500/30">
+                                {mimeLabel.length > 15 ? 'Verified File' : mimeLabel}
+                              </span>
+                            </div>
                           </div>
                         );
                       })}
@@ -1145,9 +1260,11 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
                     variant="primary"
                     size="sm"
                     leftIcon={<CheckCircle2 size={15} />}
-                    onClick={() => setIsSubmitModalOpen(true)}
+                    isLoading={isSubmitting}
+                    disabled={isSubmitting}
+                    onClick={handleFinalSubmit}
                   >
-                    Finalize & Submit Score
+                    {isSubmitting ? 'Finalizing & Submitting...' : 'Finalize & Submit Score'}
                   </Button>
                 ) : (
                   <div className="flex items-center gap-2">
@@ -1291,17 +1408,6 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
         </Modal>
       )}
 
-      {/* ── CONFIRM SUBMIT MODAL ── */}
-      <ConfirmDialog
-        isOpen={isSubmitModalOpen}
-        onClose={() => setIsSubmitModalOpen(false)}
-        onConfirm={handleFinalSubmit}
-        isLoading={isSubmitting}
-        title="Submit Official Judge Evaluation"
-        description={`You are submitting a final score of ${totalScore}/100 for "${projectTitle}" (${teamDisplayName}). Once submitted, your scores and deduction rationale will be permanently locked.`}
-        confirmText="Confirm & Submit Score"
-        variant="primary"
-      />
 
       {/* ── CONFLICT OF INTEREST MODAL ── */}
       <Modal

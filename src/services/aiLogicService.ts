@@ -20,6 +20,7 @@ import type {
   RubricVersion,
   AiEvaluationReport,
   CriterionEvaluationResult,
+  EvaluationOutcome,
 } from '../types/aiEvaluation';
 
 /**
@@ -42,13 +43,39 @@ export interface StructuredEvaluationObservation {
 export interface InferenceTelemetry {
   requestedMode: InferenceMode;
   actualInferenceSource: 'ON_DEVICE' | 'IN_CLOUD' | 'UNKNOWN';
+  actualExecutionMode?: 'ON_DEVICE' | 'IN_CLOUD' | 'FALLBACK';
+  provider?: string;
+  modelIdentifier?: string;
+  sdkVersion?: string;
   modelUsed: string;
   latencyMs: number;
   fallbackOccurred: boolean;
   fallbackReason?: string;
-  appCheckStatus: 'ACTIVE_AND_VERIFIED' | 'BYPASSED_DEV_MODE';
+  appCheckStatus: 'ACTIVE_AND_VERIFIED' | 'BYPASSED_DEV_MODE' | 'FAILED';
   timestamp: string;
+  inferenceTimestamp?: string;
+  requestId?: string;
+  rubricVersionNumber?: number;
+  evidencePacketVersion?: string | number;
+  evaluationOutcome?: EvaluationOutcome;
+  tokenUsage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
   rawTextPreview?: string;
+}
+
+/**
+ * Options for fine-grained AI evaluation execution, cancellation, and fallback controls.
+ */
+export interface AiEvaluationOptions {
+  timeoutMs?: number;
+  abortSignal?: AbortSignal;
+  requestId?: string;
+  allowFallback?: boolean;
+  workerIdentity?: string;
+  evidencePacketVersion?: string | number;
 }
 
 /**
@@ -74,7 +101,16 @@ export interface DeviceModelCapability {
   notes: string;
 }
 
-// ── STRUCTURED OUTPUT JSON SCHEMA ─────────────────────
+// ── IN-FLIGHT REQUEST CANCELLATION TRACKER ─────────────────────
+export interface InFlightEvaluationRequest {
+  abortController: AbortController;
+  cancelled: boolean;
+  startTime: number;
+}
+
+export const inFlightEvaluationRequests = new Map<string, InFlightEvaluationRequest>();
+
+// ── STRUCTURED OUTPUT JSON SCHEMAS ─────────────────────
 // Uses official firebase/ai Schema builder for strict JSON outputs
 
 export const projectEvaluationSchema = Schema.object({
@@ -111,10 +147,94 @@ export const projectEvaluationSchema = Schema.object({
   optionalProperties: ['keyRecommendations'],
 });
 
+export const rubricCriterionSchema = Schema.object({
+  properties: {
+    criterionId: Schema.string({ description: 'The unique ID of the rubric criterion' }),
+    criterionName: Schema.string({ description: 'The name of the rubric criterion' }),
+    suggestedScore: Schema.number({
+      description: 'Suggested score between 0 and maxScore based on verified evidence',
+    }),
+    maxScore: Schema.number({ description: 'Maximum score possible for this criterion' }),
+    explanation: Schema.string({ description: 'Detailed justification for the score suggestion based on evidence' }),
+    positiveObservations: Schema.array({
+      items: Schema.string(),
+      description: 'Positive verifiable observations from submitted evidence',
+    }),
+    missingEvidence: Schema.array({
+      items: Schema.string(),
+      description: 'Required evidence items that were absent or unverified',
+    }),
+    evidenceReferences: Schema.array({
+      items: Schema.string(),
+      description: 'Direct references to files, sections, or artifacts inspected',
+    }),
+    weaknesses: Schema.array({
+      items: Schema.string(),
+      description: 'Specific weaknesses identified from submitted artifacts',
+    }),
+    exactDeductionExplanations: Schema.array({
+      items: Schema.string(),
+      description: 'Explicit point deductions explaining reasons for any lost marks',
+    }),
+    uncertainty: Schema.string({ description: 'Any uncertainties, caveats, or ambiguities in the submitted artifacts' }),
+    confidence: Schema.string({ description: 'Confidence level: HIGH, MEDIUM, or LOW' }),
+    confidenceJustification: Schema.string({ description: 'Explanation for why this confidence level was assigned' }),
+    limitations: Schema.array({
+      items: Schema.string(),
+      description: 'Limitations of the inspection (e.g. static inspection, no runtime execution)',
+    }),
+    questionsForJudge: Schema.array({
+      items: Schema.string(),
+      description: 'Targeted questions or inspection items recommended for human judges to verify',
+    }),
+    evidenceClassifications: Schema.array({
+      items: Schema.object({
+        properties: {
+          claim: Schema.string({ description: 'The specific capability or deliverable claimed' }),
+          classification: Schema.string({
+            description:
+              'Classification: VERIFIED_EVIDENCE, CLAIM_ONLY, MISSING_EVIDENCE, INACCESSIBLE_EVIDENCE, UNCLEAR_EVIDENCE, or NOT_INSPECTED',
+          }),
+          rationale: Schema.string({ description: 'Specific rationale for this classification' }),
+        },
+      }),
+      description: 'Granular evidence classifications for individual claims',
+    }),
+  },
+});
+
+export const rubricEvaluationReportSchema = Schema.object({
+  properties: {
+    executiveSummary: Schema.string({ description: 'Executive summary synthesizing the evaluation' }),
+    strongestAspects: Schema.array({ items: Schema.string(), description: 'Top strengths grounded in evidence' }),
+    areasToImprove: Schema.array({ items: Schema.string(), description: 'Constructive areas for technical improvement' }),
+    evidenceGaps: Schema.array({ items: Schema.string(), description: 'Gaps where evidence was missing or inaccessible' }),
+    evaluationWarnings: Schema.array({ items: Schema.string(), description: 'Mandatory warnings and disclaimers' }),
+    criteriaEvaluations: Schema.array({
+      items: rubricCriterionSchema,
+      description: 'Detailed evaluation of each rubric criterion',
+    }),
+  },
+});
+
 export const STANDARD_EVALUATION_PROMPT =
   'Evaluate this project summary for clarity, originality and technical feasibility. Return structured observations.';
 
 export const aiLogicService = {
+  /**
+   * Cancels an active in-flight AI evaluation request safely.
+   */
+  cancelEvaluationRequest(requestId: string, reason = 'Evaluation request cancelled'): boolean {
+    const inFlight = inFlightEvaluationRequests.get(requestId);
+    if (inFlight) {
+      inFlight.cancelled = true;
+      inFlight.abortController.abort(new Error(reason));
+      inFlightEvaluationRequests.delete(requestId);
+      return true;
+    }
+    return false;
+  },
+
   /**
    * Bridges window.ai.languageModel to window.LanguageModel if needed
    * to align Chrome experimental implementations with the Prompt API standard.
@@ -247,29 +367,88 @@ export const aiLogicService = {
   },
 
   /**
+   * Creates a GenerativeModel configured for complete rubric evaluation with
+   * structured output Schema, Gemini 2.5 Flash cloud backend, and on-device Gemini Nano parameters.
+   */
+  createRubricModel(mode: InferenceMode = InferenceMode.PREFER_ON_DEVICE): GenerativeModel {
+    this.ensureChromePromptApiBridge();
+    const aiInstance = this.getAIInstance();
+
+    return getGenerativeModel(aiInstance, {
+      mode,
+      inCloudParams: {
+        model: 'gemini-2.5-flash',
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: rubricEvaluationReportSchema,
+        },
+        systemInstruction:
+          'You are Evalora AI Logic, the impartial evaluation engine for hackathons and competitions. ' +
+          'Evaluate the submitted project strictly according to the evidence rules and rubric. ' +
+          'Never invent evidence. Disclaim uninspected content. Every deduction must cite exact missing evidence. ' +
+          'Return a structured JSON document conforming to the requested schema.',
+      },
+      onDeviceParams: {
+        createOptions: {
+          expectedInputs: [{ type: 'text', languages: ['en'] }],
+          expectedOutputs: [{ type: 'text', languages: ['en'] }],
+        },
+      },
+    });
+  },
+
+  /**
    * Executes an actual runtime Firebase AI Logic evaluation against a project summary.
    * Tracks exact inference source, handles on-device availability, cloud fallbacks,
    * and safe telemetry reporting without mocks or fake data.
    */
   async evaluateProjectSummary(
     projectSummary: string,
-    mode: InferenceMode = InferenceMode.PREFER_ON_DEVICE
+    mode: InferenceMode = InferenceMode.PREFER_ON_DEVICE,
+    options?: { timeoutMs?: number; abortSignal?: AbortSignal; requestId?: string }
   ): Promise<HybridEvaluationResult> {
     const startTime = performance.now();
     const timestamp = new Date().toISOString();
+    const reqId = options?.requestId || `summary-${Math.random().toString(36).substring(2, 9)}-${Date.now().toString(36)}`;
+    const timeoutMs = options?.timeoutMs ?? 25000;
+
+    const abortController = new AbortController();
+    inFlightEvaluationRequests.set(reqId, {
+      abortController,
+      cancelled: false,
+      startTime,
+    });
+
+    if (options?.abortSignal) {
+      if (options.abortSignal.aborted) {
+        abortController.abort(options.abortSignal.reason);
+      } else {
+        options.abortSignal.addEventListener('abort', () => {
+          abortController.abort(options.abortSignal?.reason);
+        });
+      }
+    }
 
     const telemetry: InferenceTelemetry = {
       requestedMode: mode,
       actualInferenceSource: 'UNKNOWN',
+      actualExecutionMode: 'IN_CLOUD',
+      provider: 'firebase-ai-logic',
+      modelIdentifier: 'gemini-2.5-flash',
+      sdkVersion: '11.0.0',
       modelUsed: 'Resolving...',
       latencyMs: 0,
       fallbackOccurred: false,
       appCheckStatus: appCheck ? 'ACTIVE_AND_VERIFIED' : 'BYPASSED_DEV_MODE',
       timestamp,
+      inferenceTimestamp: timestamp,
+      requestId: reqId,
+      evaluationOutcome: 'AI_COMPLETED',
     };
 
     if (!projectSummary || !projectSummary.trim()) {
       telemetry.latencyMs = Math.round(performance.now() - startTime);
+      inFlightEvaluationRequests.delete(reqId);
       return {
         success: false,
         telemetry,
@@ -304,14 +483,33 @@ PROJECT SUMMARY:
 ${projectSummary.trim()}
 """`;
 
-      // 4. Invoke runtime model generateContent with fast timeout protection
-      const timeoutMs = 3500;
+      // 4. Invoke runtime model generateContent with timeout & cancellation protection
+      let timeoutHandle: any;
       const generatePromise = model.generateContent(fullPrompt);
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Firebase AI Logic call timed out after ${timeoutMs}ms; using fast evaluation engine.`)), timeoutMs)
-      );
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error(`Firebase AI Logic call timed out after ${timeoutMs}ms.`)),
+          timeoutMs
+        );
+      });
+      const abortPromise = new Promise<never>((_, reject) => {
+        abortController.signal.addEventListener('abort', () => {
+          reject(new Error(`Evaluation cancelled: ${abortController.signal.reason?.message || 'Aborted'}`));
+        });
+      });
 
-      const generateResult = await Promise.race([generatePromise, timeoutPromise]);
+      let generateResult: any;
+      try {
+        generateResult = await Promise.race([generatePromise, timeoutPromise, abortPromise]);
+      } finally {
+        clearTimeout(timeoutHandle);
+      }
+
+      const inFlightState = inFlightEvaluationRequests.get(reqId);
+      if (inFlightState?.cancelled || abortController.signal.aborted) {
+        throw new Error('Evaluation cancelled: response discarded.');
+      }
+
       const response = generateResult.response;
       const rawText = response.text();
       telemetry.rawTextPreview = rawText.slice(0, 500);
@@ -320,10 +518,14 @@ ${projectSummary.trim()}
       const source = response.inferenceSource;
       if (source === InferenceSource.ON_DEVICE) {
         telemetry.actualInferenceSource = 'ON_DEVICE';
+        telemetry.actualExecutionMode = 'ON_DEVICE';
+        telemetry.modelIdentifier = 'gemini-nano-4';
         telemetry.modelUsed = 'Gemini Nano 4 (On-Device Chrome Prompt API)';
         telemetry.fallbackOccurred = false;
       } else if (source === InferenceSource.IN_CLOUD) {
         telemetry.actualInferenceSource = 'IN_CLOUD';
+        telemetry.actualExecutionMode = 'IN_CLOUD';
+        telemetry.modelIdentifier = 'gemini-2.5-flash';
         telemetry.modelUsed = 'gemini-2.5-flash (Google AI Cloud Backend)';
         if (mode === InferenceMode.PREFER_ON_DEVICE) {
           telemetry.fallbackOccurred = true;
@@ -332,17 +534,14 @@ ${projectSummary.trim()}
             : `On-device Gemini Nano unavailable (${deviceCaps.availabilityStatus}). Automatically fell back to cloud Gemini 2.5 Flash.`;
         }
       } else {
-        // Source not explicitly set on response object: derive honestly from device capability
-        if (deviceCaps.geminiNanoReady && mode === InferenceMode.ONLY_ON_DEVICE) {
-          telemetry.actualInferenceSource = 'ON_DEVICE';
-          telemetry.modelUsed = 'Gemini Nano 4 (On-Device)';
-        } else {
-          telemetry.actualInferenceSource = 'IN_CLOUD';
-          telemetry.modelUsed = 'gemini-2.5-flash (Cloud)';
-          if (mode === InferenceMode.PREFER_ON_DEVICE) {
-            telemetry.fallbackOccurred = true;
-            telemetry.fallbackReason = `On-device model status is "${deviceCaps.availabilityStatus}". Automated cloud fallback engaged.`;
-          }
+        // Source not explicitly set on response object: do not guess ON_DEVICE without SDK confirmation
+        telemetry.actualInferenceSource = 'UNKNOWN';
+        telemetry.actualExecutionMode = 'IN_CLOUD';
+        telemetry.modelIdentifier = 'gemini-2.5-flash';
+        telemetry.modelUsed = 'gemini-2.5-flash (Cloud - unverified source)';
+        if (mode === InferenceMode.PREFER_ON_DEVICE) {
+          telemetry.fallbackOccurred = true;
+          telemetry.fallbackReason = `On-device model status is "${deviceCaps.availabilityStatus}". Automated cloud fallback engaged.`;
         }
       }
 
@@ -378,6 +577,8 @@ ${projectSummary.trim()}
         error: userFriendlyError,
         errorDetails: errorMessage,
       };
+    } finally {
+      inFlightEvaluationRequests.delete(reqId);
     }
   },
 
@@ -530,19 +731,49 @@ ${projectSummary.trim()}
   async evaluateSubmissionEvidence(
     packet: StructuredEvidencePacket,
     rubricVersion: RubricVersion,
-    mode: InferenceMode = InferenceMode.PREFER_ON_DEVICE
+    mode: InferenceMode = InferenceMode.PREFER_ON_DEVICE,
+    options?: AiEvaluationOptions
   ): Promise<AiEvaluationReport> {
     const startTime = performance.now();
     const timestamp = new Date().toISOString();
+    const requestId = options?.requestId || `req-${Math.random().toString(36).substring(2, 9)}-${Date.now().toString(36)}`;
+    const timeoutMs = options?.timeoutMs ?? 25000;
+    const allowFallback = options?.allowFallback ?? true;
+
+    const abortController = new AbortController();
+    inFlightEvaluationRequests.set(requestId, {
+      abortController,
+      cancelled: false,
+      startTime,
+    });
+
+    if (options?.abortSignal) {
+      if (options.abortSignal.aborted) {
+        abortController.abort(options.abortSignal.reason);
+      } else {
+        options.abortSignal.addEventListener('abort', () => {
+          abortController.abort(options.abortSignal?.reason);
+        });
+      }
+    }
 
     const telemetry: InferenceTelemetry = {
       requestedMode: mode,
       actualInferenceSource: 'UNKNOWN',
+      actualExecutionMode: 'IN_CLOUD',
+      provider: 'firebase-ai-logic',
+      modelIdentifier: 'gemini-2.5-flash',
+      sdkVersion: '11.0.0',
       modelUsed: 'Resolving...',
       latencyMs: 0,
       fallbackOccurred: false,
       appCheckStatus: appCheck ? 'ACTIVE_AND_VERIFIED' : 'BYPASSED_DEV_MODE',
       timestamp,
+      inferenceTimestamp: timestamp,
+      requestId,
+      rubricVersionNumber: rubricVersion.versionNumber,
+      evidencePacketVersion: options?.evidencePacketVersion ?? 1,
+      evaluationOutcome: 'AI_COMPLETED',
     };
 
     // 1. Build Rubric & Evidence Prompt
@@ -555,50 +786,68 @@ ${projectSummary.trim()}
       // Probe device capabilities
       const deviceCaps = await this.checkDeviceCapabilities();
 
-      // Ensure Prompt API bridge
-      this.ensureChromePromptApiBridge();
-      const aiInstance = this.getAIInstance();
+      // If ONLY_ON_DEVICE is requested but Prompt API is unavailable or non-Chrome, throw explicit error
+      if (mode === InferenceMode.ONLY_ON_DEVICE && (!deviceCaps.isChrome || !deviceCaps.geminiNanoReady)) {
+        throw new Error(
+          `On-device inference (ONLY_ON_DEVICE) is unavailable in this environment (${deviceCaps.notes}). Prompt API requires Chrome with Gemini Nano enabled.`
+        );
+      }
 
-      const model = getGenerativeModel(aiInstance, {
-        mode,
-        inCloudParams: {
-          model: 'gemini-2.5-flash',
-          generationConfig: {
-            responseMimeType: 'application/json',
-          },
-          systemInstruction:
-            'You are Evalora AI Logic, the impartial evaluation engine for hackathons and competitions. ' +
-            'Evaluate the submitted project strictly according to the evidence rules and rubric. ' +
-            'Never invent evidence. Disclaim uninspected content. Every deduction must cite exact missing evidence. ' +
-            'Return a structured JSON document conforming to the requested schema.',
-        },
-        onDeviceParams: {
-          createOptions: {
-            expectedInputs: [{ type: 'text', languages: ['en'] }],
-            expectedOutputs: [{ type: 'text', languages: ['en'] }],
-          },
-        },
+      const model = this.createRubricModel(mode);
+
+      let timeoutHandle: any;
+      const generatePromise = model.generateContent(prompt);
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error(`Firebase AI Logic call timed out after ${timeoutMs}ms.`)),
+          timeoutMs
+        );
+      });
+      const abortPromise = new Promise<never>((_, reject) => {
+        abortController.signal.addEventListener('abort', () => {
+          reject(new Error(`Evaluation cancelled: ${abortController.signal.reason?.message || 'Aborted'}`));
+        });
       });
 
-      const timeoutMs = 3500;
-      const generatePromise = model.generateContent(prompt);
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Firebase AI Logic call timed out after ${timeoutMs}ms; using deterministic hybrid engine.`)), timeoutMs)
-      );
+      let generateResult: any;
+      try {
+        generateResult = await Promise.race([generatePromise, timeoutPromise, abortPromise]);
+      } finally {
+        clearTimeout(timeoutHandle);
+      }
 
-      const generateResult = await Promise.race([generatePromise, timeoutPromise]);
+      const inFlightState = inFlightEvaluationRequests.get(requestId);
+      if (inFlightState?.cancelled || abortController.signal.aborted) {
+        throw new Error('Evaluation cancelled: late response safely discarded.');
+      }
+
       const response = generateResult.response;
       rawResponseText = response.text();
       telemetry.rawTextPreview = rawResponseText.slice(0, 500);
 
-      // Determine inference source honestly
+      // Usage metadata if provided by SDK
+      if (response.usageMetadata) {
+        telemetry.tokenUsage = {
+          promptTokens: response.usageMetadata.promptTokenCount,
+          completionTokens: response.usageMetadata.candidatesTokenCount,
+          totalTokens: response.usageMetadata.totalTokenCount,
+        };
+      }
+
+      // Determine inference source honestly: never guess ON_DEVICE without SDK confirmation
       const source = response.inferenceSource;
       if (source === InferenceSource.ON_DEVICE) {
         telemetry.actualInferenceSource = 'ON_DEVICE';
+        telemetry.actualExecutionMode = 'ON_DEVICE';
+        telemetry.provider = 'firebase-ai-logic';
+        telemetry.modelIdentifier = 'gemini-nano-4';
         telemetry.modelUsed = 'Gemini Nano 4 (On-Device Chrome Prompt API)';
         telemetry.fallbackOccurred = false;
       } else if (source === InferenceSource.IN_CLOUD) {
         telemetry.actualInferenceSource = 'IN_CLOUD';
+        telemetry.actualExecutionMode = 'IN_CLOUD';
+        telemetry.provider = 'firebase-ai-logic';
+        telemetry.modelIdentifier = 'gemini-2.5-flash';
         telemetry.modelUsed = 'gemini-2.5-flash (Google AI Cloud Backend)';
         if (mode === InferenceMode.PREFER_ON_DEVICE) {
           telemetry.fallbackOccurred = true;
@@ -607,27 +856,51 @@ ${projectSummary.trim()}
             : `On-device Gemini Nano unavailable (${deviceCaps.availabilityStatus}). Automated fallback to cloud Gemini 2.5 Flash.`;
         }
       } else {
-        if (deviceCaps.geminiNanoReady && mode === InferenceMode.ONLY_ON_DEVICE) {
-          telemetry.actualInferenceSource = 'ON_DEVICE';
-          telemetry.modelUsed = 'Gemini Nano 4 (On-Device)';
-        } else {
-          telemetry.actualInferenceSource = 'IN_CLOUD';
-          telemetry.modelUsed = 'gemini-2.5-flash (Cloud)';
-          if (mode === InferenceMode.PREFER_ON_DEVICE) {
-            telemetry.fallbackOccurred = true;
-            telemetry.fallbackReason = `On-device model status is "${deviceCaps.availabilityStatus}". Automated cloud fallback engaged.`;
-          }
+        telemetry.actualInferenceSource = 'UNKNOWN';
+        telemetry.actualExecutionMode = 'IN_CLOUD';
+        telemetry.provider = 'firebase-ai-logic';
+        telemetry.modelIdentifier = 'gemini-2.5-flash';
+        telemetry.modelUsed = 'gemini-2.5-flash (Cloud - unverified source)';
+        if (mode === InferenceMode.PREFER_ON_DEVICE) {
+          telemetry.fallbackOccurred = true;
+          telemetry.fallbackReason = `On-device model status is "${deviceCaps.availabilityStatus}". Automated cloud fallback engaged.`;
         }
       }
 
       parsedJson = this.extractJsonFromText(rawResponseText);
+      if (!parsedJson || typeof parsedJson !== 'object') {
+        throw new Error('Model output failed structured JSON schema validation: missing or invalid object.');
+      }
+      telemetry.evaluationOutcome = 'AI_COMPLETED';
     } catch (err: any) {
-      // Deterministic fallback for offline / test environments without live Firebase
-      telemetry.actualInferenceSource = 'IN_CLOUD';
-      telemetry.modelUsed = 'gemini-2.5-flash (Simulated Engine / Offline Fallback)';
+      const inFlightState = inFlightEvaluationRequests.get(requestId);
+      const isCancelled = inFlightState?.cancelled || abortController.signal.aborted;
+      if (isCancelled && options?.abortSignal?.aborted) {
+        throw err;
+      }
+
+      if (!allowFallback) {
+        telemetry.actualInferenceSource = 'UNKNOWN';
+        telemetry.actualExecutionMode = 'FALLBACK';
+        telemetry.provider = 'firebase-ai-logic';
+        telemetry.modelIdentifier = 'gemini-2.5-flash';
+        telemetry.evaluationOutcome = 'AI_FAILED';
+        telemetry.latencyMs = Math.max(1, Math.round(performance.now() - startTime));
+        throw new Error(`AI Evaluation Failed (fallback disallowed): ${err?.message || String(err)}`);
+      }
+
+      // Deterministic fallback path: must NEVER claim to be AI evaluation
+      telemetry.actualInferenceSource = 'UNKNOWN';
+      telemetry.actualExecutionMode = 'FALLBACK';
+      telemetry.provider = 'deterministic-rule-engine';
+      telemetry.modelIdentifier = 'deterministic-heuristic-engine-v1';
+      telemetry.modelUsed = 'deterministic-heuristic-engine-v1';
       telemetry.fallbackOccurred = true;
       telemetry.fallbackReason = `Firebase AI Logic runtime call handled via deterministic evidence evaluator (${err?.message || 'offline test environment'}).`;
+      telemetry.evaluationOutcome = 'DETERMINISTIC_FALLBACK';
       parsedJson = this.generateDeterministicEvidenceEvaluation(packet, rubricVersion);
+    } finally {
+      inFlightEvaluationRequests.delete(requestId);
     }
 
     telemetry.latencyMs = Math.max(1, Math.round(performance.now() - startTime));
@@ -638,6 +911,7 @@ ${projectSummary.trim()}
     const baseline = this.generateDeterministicEvidenceEvaluation(packet, rubricVersion);
 
     // 3. Assemble criteria evaluations against immutable rubric version with strict anti-duplication & track checks
+    const isFallbackOutcome = telemetry.evaluationOutcome === 'DETERMINISTIC_FALLBACK';
     const criteriaEvaluations: CriterionEvaluationResult[] = rubricVersion.criteria.map((crit) => {
       const found = parsedJson?.criteriaEvaluations?.find(
         (c: any) => c.criterionId === crit.id || c.criterionName?.toLowerCase() === crit.name.toLowerCase()
@@ -704,10 +978,18 @@ ${projectSummary.trim()}
       const defaultEvidenceClassifications: CriterionEvaluationResult['evidenceClassifications'] = [
         {
           claim: `Implementation evidence for ${crit.name}`,
+          classification: 'VERIFIED_EVIDENCE',
+          rationale: 'Verified from project description and submitted artifact metadata.',
+        },
+        {
+          claim: `Implementation evidence for ${crit.name}`,
           classification: 'EVIDENCE_VERIFIED',
           rationale: 'Verified from project description and submitted artifact metadata.',
         },
       ];
+
+      const rawConfidence = (['HIGH', 'MEDIUM', 'LOW'].includes(found?.confidence) ? found.confidence : 'HIGH') as 'HIGH' | 'MEDIUM' | 'LOW';
+      const adjustedConfidence = isFallbackOutcome ? (rawConfidence === 'LOW' ? 'LOW' : 'MEDIUM') : rawConfidence;
 
       return {
         criterionId: crit.id,
@@ -715,6 +997,9 @@ ${projectSummary.trim()}
         suggestedScore,
         maxScore,
         weight: crit.weight,
+        explanation:
+          found?.explanation ||
+          (deductions.length > 0 ? deductions.join(' ') : positiveObservations[0] || 'Evaluated against submitted criteria.'),
         positiveObservations,
         evidenceReferences: Array.isArray(found?.evidenceReferences) && found.evidenceReferences.length > 0
           ? found.evidenceReferences
@@ -724,10 +1009,24 @@ ${projectSummary.trim()}
         missingEvidence: Array.isArray(found?.missingEvidence) && found.missingEvidence.length > 0
           ? found.missingEvidence
           : (baseCrit?.missingEvidence || []),
-        confidence: (['HIGH', 'MEDIUM', 'LOW'].includes(found?.confidence) ? found.confidence : 'HIGH') as 'HIGH' | 'MEDIUM' | 'LOW',
+        uncertainty:
+          found?.uncertainty ||
+          (isFallbackOutcome
+            ? 'Deterministic heuristic evaluation cannot verify deep semantic code correctness or architectural nuance.'
+            : 'Static analysis based on provided artifacts without runtime sandbox execution.'),
+        confidence: adjustedConfidence,
+        confidenceJustification: isFallbackOutcome
+          ? 'Confidence strictly capped at MEDIUM/LOW due to deterministic fallback evaluation.'
+          : (found?.confidenceJustification || 'Evaluated against verified artifact evidence.'),
         limitations: Array.isArray(found?.limitations)
           ? found.limitations
           : ['Static evaluation only; no runtime execution sandbox was invoked.'],
+        questionsForJudge: Array.isArray(found?.questionsForJudge) && found.questionsForJudge.length > 0
+          ? found.questionsForJudge
+          : (baseCrit?.questionsForJudge || [
+              `Verify whether ${packet.projectTitle}'s implementation of ${crit.name} meets live demonstration standards.`,
+              'Inspect code repository directly for production engineering rigor.',
+            ]),
         evidenceClassifications: Array.isArray(found?.evidenceClassifications) && found.evidenceClassifications.length > 0
           ? found.evidenceClassifications
           : (baseCrit?.evidenceClassifications || defaultEvidenceClassifications),
@@ -755,6 +1054,43 @@ ${projectSummary.trim()}
     const totalMaxScore = rubricVersion.totalMaxScore || criteriaEvaluations.reduce((sum, c) => sum + c.maxScore, 0);
     const percentageScore = totalMaxScore > 0 ? Math.round((overallScore / totalMaxScore) * 100) : 85;
 
+    // Detect incomplete extractions
+    const hasIncompleteExtraction = packet.documentContents.some(
+      (doc) =>
+        doc.extractionStatus === 'EXTRACTION_FAILED' ||
+        doc.extractionStatus === 'REQUIRES_OCR' ||
+        (doc.notes && /requires\s*ocr|extraction\s*failed/i.test(doc.notes))
+    );
+
+    let finalOutcome: EvaluationOutcome = (telemetry.evaluationOutcome as EvaluationOutcome) || 'AI_COMPLETED';
+    if (hasIncompleteExtraction) {
+      finalOutcome = 'EXTRACTION_INCOMPLETE';
+      telemetry.evaluationOutcome = 'EXTRACTION_INCOMPLETE';
+    }
+
+    // Explicit judge disclosures
+    const disclosures: string[] = [
+      ...packet.evidenceDisclaimers,
+      'Static evaluation only; no runtime code execution sandbox was invoked.',
+    ];
+
+    if (telemetry.evaluationOutcome === 'DETERMINISTIC_FALLBACK') {
+      disclosures.unshift(
+        'NOTICE TO JUDGES: This evaluation was produced by the deterministic heuristic engine, NOT by AI inference, due to model unavailability or timeout.',
+        'Confidence levels are strictly capped at MEDIUM or LOW; all scores are advisory suggestions requiring human judge confirmation.'
+      );
+    }
+
+    if (packet.videoMetadata?.url) {
+      disclosures.push('Video URL provided was NOT visually or auditorily inspected by AI Logic.');
+    }
+
+    if (hasIncompleteExtraction) {
+      disclosures.push(
+        'One or more submitted documents could not be fully parsed (OCR required or unsupported format). No penalty was applied for unreadable documents.'
+      );
+    }
+
     const reportId = `ai-rep-${Math.random().toString(36).substring(2, 9)}-${Date.now().toString(36)}`;
 
     const report: AiEvaluationReport = {
@@ -766,6 +1102,9 @@ ${projectSummary.trim()}
       overallScore,
       totalMaxScore,
       percentageScore,
+      evaluationOutcome: finalOutcome,
+      requestId,
+      disclosures,
       executiveSummary:
         parsedJson?.executiveSummary && !parsedJson.executiveSummary.includes('Automated evaluation completed')
           ? parsedJson.executiveSummary
@@ -780,7 +1119,7 @@ ${projectSummary.trim()}
         ? parsedJson.evidenceGaps
         : baseline.evidenceGaps,
       evaluationWarnings: [
-        ...packet.evidenceDisclaimers,
+        ...disclosures,
         ...(!trackRelevance.isAligned && !trackRelevance.isOpenTrack ? [trackRelevance.assessmentNote] : []),
         ...(trackRelevance.isOpenTrack ? [trackRelevance.assessmentNote] : []),
         ...(Array.isArray(parsedJson?.evaluationWarnings) ? parsedJson.evaluationWarnings : []),
@@ -1351,6 +1690,11 @@ Format your response as a valid JSON object matching this structure:
           missingEvidence.push('Live hosted deployment URL');
           classifications.push({
             claim: 'Live deployment environment available for testing',
+            classification: 'INACCESSIBLE_EVIDENCE',
+            rationale: 'No accessible deployment URL found in submission packet.',
+          });
+          classifications.push({
+            claim: 'Live deployment environment available for testing',
             classification: 'EVIDENCE_UNAVAILABLE',
             rationale: 'No accessible deployment URL found in submission packet.',
           });
@@ -1361,6 +1705,11 @@ Format your response as a valid JSON object matching this structure:
           missingEvidence.push('Public source code repository');
           classifications.push({
             claim: 'Open source repository accessibility',
+            classification: 'CLAIM_ONLY',
+            rationale: packet.githubMetadata.inaccessibleReason || 'Repository was not accessible for inspection.',
+          });
+          classifications.push({
+            claim: 'Open source repository accessibility',
             classification: 'FEATURE_CLAIMED_BUT_NOT_DEMONSTRATED',
             rationale: packet.githubMetadata.inaccessibleReason || 'Repository was not accessible for inspection.',
           });
@@ -1369,8 +1718,26 @@ Format your response as a valid JSON object matching this structure:
           missingEvidence.push('Public source code repository');
           classifications.push({
             claim: 'Source code verification',
+            classification: 'CLAIM_ONLY',
+            rationale: 'No public source code link provided.',
+          });
+          classifications.push({
+            claim: 'Source code verification',
             classification: 'FEATURE_CLAIMED_BUT_NOT_DEMONSTRATED',
             rationale: 'No public source code link provided.',
+          });
+        }
+
+        if (packet.githubMetadata?.readmeContent) {
+          classifications.push({
+            claim: 'Features documented in project README',
+            classification: 'CLAIM_ONLY',
+            rationale: 'Mentioned in repository README documentation; not verified through runtime execution.',
+          });
+          classifications.push({
+            claim: 'Features documented in project README',
+            classification: 'FEATURE_CLAIMED_BUT_NOT_DEMONSTRATED',
+            rationale: 'Mentioned in repository README documentation; not verified through runtime execution.',
           });
         }
 
@@ -1505,8 +1872,26 @@ Format your response as a valid JSON object matching this structure:
       if (hasDetailedProblem || hasDetailedSolution || tech.length > 0) {
         classifications.push({
           claim: `Demonstrated alignment with ${crit.name}`,
+          classification: 'VERIFIED_EVIDENCE',
+          rationale: `Verified from submitted project details and ${tech.length} documented technologies.`,
+        });
+        classifications.push({
+          claim: `Demonstrated alignment with ${crit.name}`,
           classification: 'EVIDENCE_VERIFIED',
           rationale: `Verified from submitted project details and ${tech.length} documented technologies.`,
+        });
+      }
+
+      if (hasVideo) {
+        classifications.push({
+          claim: 'Video presentation and walkthrough',
+          classification: 'NOT_INSPECTED',
+          rationale: 'Video content was not visually or auditorily inspected by static analysis engine.',
+        });
+        classifications.push({
+          claim: 'Video presentation and walkthrough',
+          classification: 'TECHNICAL_BEHAVIOR_NOT_TESTED',
+          rationale: 'Video content was not visually or auditorily inspected by static analysis engine.',
         });
       }
 
@@ -1517,12 +1902,15 @@ Format your response as a valid JSON object matching this structure:
       }, 0);
 
       const suggestedScore = Math.max(1, maxScore - totalDeductedPoints);
+      const criterionConfidence: 'MEDIUM' | 'LOW' = isExplicitWeak ? 'LOW' : 'MEDIUM';
 
       return {
         criterionId: crit.id,
         criterionName: crit.name,
         suggestedScore,
         maxScore,
+        explanation:
+          deductions.length > 0 ? deductions.join(' ') : positiveObs[0] || `Evaluated against ${crit.name} criteria.`,
         positiveObservations: positiveObs,
         evidenceReferences: [
           title,
@@ -1532,10 +1920,18 @@ Format your response as a valid JSON object matching this structure:
         weaknesses: deductions.length > 0 ? deductions : ['Could provide further edge-case stress benchmarks.'],
         exactDeductionExplanations: deductions,
         missingEvidence,
-        confidence: 'HIGH' as const,
+        uncertainty: 'Deterministic heuristic evaluation cannot verify deep semantic code correctness or architectural nuance.',
+        confidence: criterionConfidence,
+        confidenceJustification: isExplicitWeak
+          ? 'Low confidence: sparse documentation and no public deliverables were available for inspection.'
+          : 'Medium confidence: evaluated via deterministic heuristics against submitted metadata without deep semantic AI parsing.',
         limitations: [
           'Static evaluation based on provided artifacts.',
           'No code execution sandbox was invoked.',
+        ],
+        questionsForJudge: [
+          `Verify whether ${title}'s implementation of ${crit.name} meets the competition expectations in actual demonstration.`,
+          `Inspect code structure and commits directly if source repository access is available.`,
         ],
         evidenceClassifications: classifications,
       };
@@ -1626,3 +2022,31 @@ Format your response as a valid JSON object matching this structure:
     };
   },
 };
+
+/**
+ * Asserts evaluation integrity constraints ensuring AI results remain non-authoritative suggestions.
+ */
+export function assertEvaluationIntegrity(
+  report: AiEvaluationReport,
+  context: { userRole?: string; action: string }
+): void {
+  // 1. AI cannot publish winners
+  if (context.action === 'PUBLISH_WINNERS' || context.action === 'FINALIZE_AWARDS') {
+    throw new Error('Integrity violation: AI evaluation cannot publish winners or finalize competition awards.');
+  }
+
+  // 2. AI cannot override human evaluations
+  if (context.action === 'OVERRIDE_HUMAN_EVALUATION') {
+    throw new Error('Integrity violation: AI evaluation suggestions cannot override sovereign human judge evaluations.');
+  }
+
+  // 3. AI cannot reopen locked judge evaluations
+  if (context.action === 'REOPEN_LOCKED_EVALUATION') {
+    throw new Error('Integrity violation: AI evaluation cannot reopen or mutate locked judge evaluations.');
+  }
+
+  // 4. Verify AI report is immutable
+  if (!report.isImmutable) {
+    throw new Error('Integrity violation: AI evaluation report must be marked immutable.');
+  }
+}

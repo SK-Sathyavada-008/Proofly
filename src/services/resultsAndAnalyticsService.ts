@@ -21,16 +21,41 @@ import type {
   ScoreDistributionBucket,
   TieBreakerRule,
 } from '../types/scoringAndResults';
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  limit,
+  query,
+  setDoc,
+  startAfter,
+  where,
+  type Firestore,
+  type QueryConstraint,
+} from 'firebase/firestore';
+import { isDemoModeEnabled } from '../config/firebase';
+import { sanitizeFirestoreData } from '../utils/firestoreUtils';
+import {
+  PersistenceError,
+  clampPageSize,
+  mapFirestoreError,
+  resolveFirestore,
+  withServerTimestamps,
+  type FirestoreExecutionOptions,
+  type PaginatedResult,
+  type PaginationOptions,
+} from './firestorePersistenceService';
+import {
+  resolveTrustedExecutor,
+  type TrustedBackendExecutor,
+} from './trustedBackendPersistence';
 import { competitionService } from './competitionService';
 import { submissionService } from './submissionService';
 import { evaluationPipelineService } from './evaluationPipelineService';
 import { judgeAssignmentService } from './judgeAssignmentService';
 import { scoringLedgerService } from './scoringLedgerService';
 import { governanceAuditService } from './governanceAuditService';
-import { purgeLegacySampleStorageOnce } from '../utils/cleanSampleStorage';
-
-const POLICY_STORAGE_KEY = 'proofly_scoring_policies_v1';
-const PUBLICATION_STORAGE_KEY = 'proofly_results_publications_v1';
 
 export const AI_HUMAN_CORRELATION_DISCLAIMER =
   'IMPORTANT GOVERNANCE NOTICE: AI/human score agreement measures statistical alignment only and is NEVER proof of correctness. Human judge decisions remain the sole official authority unless an organizer explicitly configures an AI-assisted policy.';
@@ -90,56 +115,165 @@ export interface EntryScoringInput {
 }
 
 class ResultsAndAnalyticsService {
+  // Unit-test-only / read-through maps (NEVER used as silent write fallback when Firestore is active)
   private policies: Map<string, CompetitionScoringPolicy> = new Map();
   private publications: Map<string, ResultPublicationRecord> = new Map();
   private demoSeededCompetitions: Set<string> = new Set();
 
-  constructor() {
-    this.loadFromStorage();
-  }
-
-  private loadFromStorage() {
-    purgeLegacySampleStorageOnce();
-    try {
-      if (typeof window === 'undefined' || !window.localStorage) return;
-      const rawPolicies = window.localStorage.getItem(POLICY_STORAGE_KEY);
-      if (rawPolicies) {
-        const parsed = JSON.parse(rawPolicies) as Record<string, CompetitionScoringPolicy>;
-        Object.entries(parsed).forEach(([k, v]) => this.policies.set(k, v));
-      }
-
-      const rawPubs = window.localStorage.getItem(PUBLICATION_STORAGE_KEY);
-      if (rawPubs) {
-        const parsed = JSON.parse(rawPubs) as Record<string, ResultPublicationRecord>;
-        Object.entries(parsed).forEach(([k, v]) => this.publications.set(k, v));
-      }
-    } catch {
-      // Ignore storage errors
-    }
-  }
-
-  private saveToStorage() {
-    try {
-      if (typeof window === 'undefined' || !window.localStorage) return;
-      const policyObj: Record<string, CompetitionScoringPolicy> = {};
-      this.policies.forEach((v, k) => {
-        policyObj[k] = v;
-      });
-      window.localStorage.setItem(POLICY_STORAGE_KEY, JSON.stringify(policyObj));
-
-      const pubObj: Record<string, ResultPublicationRecord> = {};
-      this.publications.forEach((v, k) => {
-        pubObj[k] = v;
-      });
-      window.localStorage.setItem(PUBLICATION_STORAGE_KEY, JSON.stringify(pubObj));
-    } catch {
-      // Ignore storage errors
-    }
-  }
-
   // ─────────────────────────────────────────────
-  // 1. SCORING POLICY CONFIGURATION
+  // 1. SCORING POLICY CONFIGURATION (Firestore: /scoringPolicies/{competitionId})
   // ─────────────────────────────────────────────
+
+  /**
+   * Loads the authoritative scoring policy from Firestore (or returns default if none configured).
+   */
+  public async loadScoringPolicyFromFirestore(
+    competitionId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<CompetitionScoringPolicy> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      try {
+        const snap = await getDoc(doc(fs, 'scoringPolicies', competitionId));
+        if (snap.exists()) {
+          const policy = snap.data() as CompetitionScoringPolicy;
+          this.policies.set(competitionId, policy);
+          return policy;
+        }
+      } catch (err) {
+        throw mapFirestoreError(err, 'loadScoringPolicyFromFirestore', 'scoringPolicies');
+      }
+    }
+    return this.getScoringPolicy(competitionId);
+  }
+
+  /**
+   * Durably persists an updated scoring policy to Firestore `/scoringPolicies/{competitionId}`.
+   * Throws PersistenceError on failure (zero silent fallback).
+   */
+  public async saveScoringPolicyDurable(
+    params: {
+      organizationId: string;
+      competitionId: string;
+      policyType: AggregationPolicyType;
+      includeAiAsJudgeScore?: boolean;
+      aiWeight?: number;
+      judgeWeights?: Record<string, number>;
+      roundWeights?: Record<string, number>;
+      tieBreakers?: TieBreakerRule[];
+      organizerUserId: string;
+      organizerName: string;
+      actorRole: 'ORGANIZER' | 'JUDGE' | 'PARTICIPANT';
+      reason: string;
+    },
+    options?: FirestoreExecutionOptions & { trustedExecutor?: TrustedBackendExecutor }
+  ): Promise<CompetitionScoringPolicy> {
+    const updated = this.buildValidatedPolicy(params);
+    const fs = resolveFirestore(options?.firestore);
+
+    if (fs) {
+      try {
+        await setDoc(
+          doc(fs, 'scoringPolicies', params.competitionId),
+          withServerTimestamps(sanitizeFirestoreData(updated), true)
+        );
+      } catch (err) {
+        throw mapFirestoreError(err, 'saveScoringPolicyDurable', 'scoringPolicies');
+      }
+    }
+
+    this.policies.set(params.competitionId, updated);
+
+    if (options?.trustedExecutor) {
+      await governanceAuditService.recordEventDurable(
+        {
+          organizationId: params.organizationId,
+          competitionId: params.competitionId,
+          category: 'POLICY_CHANGE',
+          action: 'SCORING_POLICY_UPDATED',
+          actorId: params.organizerUserId,
+          actorName: params.organizerName,
+          actorRole: 'ORGANIZER',
+          targetId: params.competitionId,
+          targetLabel: `Scoring Policy (${updated.policyType})`,
+          reason: params.reason.trim(),
+          metadata: {
+            newPolicyType: updated.policyType,
+            includeAiAsJudgeScore: updated.includeAiAsJudgeScore,
+            aiWeight: updated.aiWeight,
+          },
+        },
+        { trustedExecutor: options.trustedExecutor }
+      );
+    }
+
+    return updated;
+  }
+
+  private buildValidatedPolicy(params: {
+    organizationId?: string;
+    competitionId: string;
+    policyType: AggregationPolicyType;
+    includeAiAsJudgeScore?: boolean;
+    aiWeight?: number;
+    judgeWeights?: Record<string, number>;
+    roundWeights?: Record<string, number>;
+    tieBreakers?: TieBreakerRule[];
+    organizerUserId: string;
+    organizerName: string;
+    actorRole: 'ORGANIZER' | 'JUDGE' | 'PARTICIPANT';
+    reason: string;
+  }): CompetitionScoringPolicy {
+    if (params.actorRole !== 'ORGANIZER') {
+      throw new Error('Only authorized organizers may modify official competition scoring policies.');
+    }
+
+    if (!params.reason || params.reason.trim().length < 3) {
+      throw new Error('A documented reason is required when updating scoring aggregation policies.');
+    }
+
+    const previous = this.getScoringPolicy(params.competitionId);
+
+    const includeAi =
+      params.policyType === 'AI_ASSISTED' && Boolean(params.includeAiAsJudgeScore);
+    const sanitizedAiWeight = includeAi
+      ? Math.max(0, Math.min(0.5, Number(params.aiWeight ?? 0.2)))
+      : 0;
+
+    const cleanJudgeWeights: Record<string, number> = {};
+    if (params.judgeWeights) {
+      for (const [jId, w] of Object.entries(params.judgeWeights)) {
+        cleanJudgeWeights[jId] = Math.max(0.1, Math.min(10, Number(w) || 1));
+      }
+    } else {
+      Object.assign(cleanJudgeWeights, previous.judgeWeights);
+    }
+
+    const cleanRoundWeights: Record<string, number> = {};
+    if (params.roundWeights) {
+      for (const [rId, w] of Object.entries(params.roundWeights)) {
+        cleanRoundWeights[rId] = Math.max(0, Number(w) || 0);
+      }
+    } else {
+      Object.assign(cleanRoundWeights, previous.roundWeights);
+    }
+
+    return {
+      organizationId: params.organizationId || previous.organizationId,
+      competitionId: params.competitionId,
+      policyType: params.policyType,
+      includeAiAsJudgeScore: includeAi,
+      aiWeight: sanitizedAiWeight,
+      judgeWeights: cleanJudgeWeights,
+      roundWeights: cleanRoundWeights,
+      tieBreakers: params.tieBreakers
+        ? params.tieBreakers.map((tb) => ({ ...tb }))
+        : previous.tieBreakers.map((tb) => ({ ...tb })),
+      updatedBy: params.organizerUserId,
+      updatedByName: params.organizerName,
+      updatedAt: new Date().toISOString(),
+    };
+  }
 
   /**
    * Returns the active scoring policy for a competition.
@@ -169,9 +303,10 @@ class ResultsAndAnalyticsService {
   }
 
   /**
-   * Updates the scoring policy through an authorized organizer workflow.
+   * Updates the scoring policy (unit-test sync helper; use saveScoringPolicyDurable for Firestore).
    */
   public updateScoringPolicy(params: {
+    organizationId?: string;
     competitionId: string;
     policyType: AggregationPolicyType;
     includeAiAsJudgeScore?: boolean;
@@ -184,62 +319,13 @@ class ResultsAndAnalyticsService {
     actorRole: 'ORGANIZER' | 'JUDGE' | 'PARTICIPANT';
     reason: string;
   }): CompetitionScoringPolicy {
-    if (params.actorRole !== 'ORGANIZER') {
-      throw new Error('Only authorized organizers may modify official competition scoring policies.');
-    }
-
-    if (!params.reason || params.reason.trim().length < 3) {
-      throw new Error('A documented reason is required when updating scoring aggregation policies.');
-    }
-
     const previous = this.getScoringPolicy(params.competitionId);
-
-    // Enforce strict governance rule: AI weight is strictly 0 unless AI_ASSISTED + explicit opt-in
-    const includeAi =
-      params.policyType === 'AI_ASSISTED' && Boolean(params.includeAiAsJudgeScore);
-    const sanitizedAiWeight = includeAi
-      ? Math.max(0, Math.min(0.5, Number(params.aiWeight ?? 0.2)))
-      : 0;
-
-    // Validate judge weights (must be positive)
-    const cleanJudgeWeights: Record<string, number> = {};
-    if (params.judgeWeights) {
-      for (const [jId, w] of Object.entries(params.judgeWeights)) {
-        cleanJudgeWeights[jId] = Math.max(0.1, Math.min(10, Number(w) || 1));
-      }
-    } else {
-      Object.assign(cleanJudgeWeights, previous.judgeWeights);
-    }
-
-    // Validate round weights
-    const cleanRoundWeights: Record<string, number> = {};
-    if (params.roundWeights) {
-      for (const [rId, w] of Object.entries(params.roundWeights)) {
-        cleanRoundWeights[rId] = Math.max(0, Number(w) || 0);
-      }
-    } else {
-      Object.assign(cleanRoundWeights, previous.roundWeights);
-    }
-
-    const updated: CompetitionScoringPolicy = {
-      competitionId: params.competitionId,
-      policyType: params.policyType,
-      includeAiAsJudgeScore: includeAi,
-      aiWeight: sanitizedAiWeight,
-      judgeWeights: cleanJudgeWeights,
-      roundWeights: cleanRoundWeights,
-      tieBreakers: params.tieBreakers
-        ? params.tieBreakers.map((tb) => ({ ...tb }))
-        : previous.tieBreakers.map((tb) => ({ ...tb })),
-      updatedBy: params.organizerUserId,
-      updatedByName: params.organizerName,
-      updatedAt: new Date().toISOString(),
-    };
+    const updated = this.buildValidatedPolicy(params);
 
     this.policies.set(params.competitionId, updated);
-    this.saveToStorage();
 
     governanceAuditService.recordEvent({
+      organizationId: updated.organizationId,
       competitionId: params.competitionId,
       category: 'POLICY_CHANGE',
       action: 'SCORING_POLICY_UPDATED',
@@ -418,6 +504,32 @@ class ResultsAndAnalyticsService {
           officialScore = round2(weightedSum / totalWeight);
         } else {
           officialScore = humanAverageScore ?? 0;
+        }
+        break;
+      }
+
+      case 'MEDIAN': {
+        // Median of finalized human judge scores
+        const judgeScores = judgeBreakdown.map((j) => j.score).sort((a, b) => a - b);
+        if (judgeScores.length === 0) {
+          officialScore = 0;
+        } else if (judgeScores.length % 2 === 1) {
+          officialScore = judgeScores[Math.floor(judgeScores.length / 2)];
+        } else {
+          const mid = judgeScores.length / 2;
+          officialScore = round2((judgeScores[mid - 1] + judgeScores[mid]) / 2);
+        }
+        break;
+      }
+
+      case 'TRIMMED_MEAN': {
+        // Lowest & highest judge score exclusion (Olympic scoring) for 3+ judges
+        const judgeScores = judgeBreakdown.map((j) => j.score).sort((a, b) => a - b);
+        if (judgeScores.length <= 2) {
+          officialScore = humanAverageScore ?? 0;
+        } else {
+          const trimmed = judgeScores.slice(1, judgeScores.length - 1);
+          officialScore = round2(trimmed.reduce((a, b) => a + b, 0) / trimmed.length);
         }
         break;
       }
@@ -681,16 +793,28 @@ class ResultsAndAnalyticsService {
   // 3. COMPETITION DATA LOADER & PREVIEW / PUBLICATION
   // ─────────────────────────────────────────────
 
-  private async loadCompetitionScoringInputs(competitionId: string): Promise<{
+  private async loadCompetitionScoringInputs(
+    competitionId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<{
     competition: Competition;
     inputs: EntryScoringInput[];
     allSubmissions: ProjectSubmission[];
     aiReports: AiEvaluationReport[];
     allHumanEvaluations: HumanJudgeEvaluation[];
   }> {
-    let comp = await competitionService.getCompetition(competitionId);
+    const fs = resolveFirestore(options?.firestore);
+    let comp = await competitionService.getCompetition(competitionId, options);
     if (!comp) {
-      const allComps = await competitionService.listAllCompetitions();
+      if (fs) {
+        throw new PersistenceError({
+          code: 'NOT_FOUND',
+          message: `Competition "${competitionId}" not found in Firestore.`,
+          operation: 'loadCompetitionScoringInputs',
+          collection: 'competitions',
+        });
+      }
+      const allComps = await competitionService.listAllCompetitions(options);
       comp = allComps[0] || {
         id: competitionId,
         organizationId: 'org-default',
@@ -733,9 +857,11 @@ class ResultsAndAnalyticsService {
 
     const resolvedComp: Competition = comp;
 
-    const allSubmissions = await submissionService.listCompetitionSubmissions(competitionId);
-    const aiReports = await evaluationPipelineService.listReportsByCompetition(competitionId);
-    const allHumanEvaluations = await judgeAssignmentService.listAllEvaluations(competitionId);
+    const [allSubmissions, aiReports, allHumanEvaluations] = await Promise.all([
+      submissionService.listCompetitionSubmissions(competitionId, options),
+      evaluationPipelineService.listReportsByCompetition(competitionId, options),
+      judgeAssignmentService.listAllEvaluations(competitionId, options),
+    ]);
 
     const reportsBySub = new Map<string, AiEvaluationReport>();
     aiReports.forEach((r) => reportsBySub.set(r.submissionId, r));
@@ -772,6 +898,7 @@ class ResultsAndAnalyticsService {
       scope?: RankingScope;
       category?: string;
       roundId?: string;
+      firestore?: Firestore;
     }
   ): Promise<{
     competition: Competition;
@@ -779,9 +906,13 @@ class ResultsAndAnalyticsService {
     publication: ResultPublicationRecord | null;
     entries: RankedEntry[];
   }> {
-    const { competition, inputs } = await this.loadCompetitionScoringInputs(competitionId);
-    const policy = this.getScoringPolicy(competitionId);
-    const publication = this.publications.get(competitionId) || null;
+    const fsOpts = options?.firestore ? { firestore: options.firestore } : undefined;
+    const { competition, inputs } = await this.loadCompetitionScoringInputs(competitionId, fsOpts);
+    const policy = await this.loadScoringPolicyFromFirestore(competitionId, fsOpts);
+    const publication =
+      (await this.getPublicationStatusFromFirestore(competitionId, fsOpts)) ||
+      this.publications.get(competitionId) ||
+      null;
 
     const entries = this.rankEntries({
       inputs,
@@ -802,15 +933,18 @@ class ResultsAndAnalyticsService {
 
   /**
    * Organizer explicitly approves and publishes official results.
-   * Freezes an immutable official snapshot for the public leaderboard.
+   * Freezes an immutable official snapshot for the public leaderboard in Firestore.
    */
-  public async publishOfficialResults(params: {
-    competitionId: string;
-    organizerUserId: string;
-    organizerName: string;
-    actorRole: 'ORGANIZER' | 'JUDGE' | 'PARTICIPANT';
-    approvalReason: string;
-  }): Promise<ResultPublicationRecord> {
+  public async publishOfficialResults(
+    params: {
+      competitionId: string;
+      organizerUserId: string;
+      organizerName: string;
+      actorRole: 'ORGANIZER' | 'JUDGE' | 'PARTICIPANT';
+      approvalReason: string;
+    },
+    options?: FirestoreExecutionOptions & { trustedExecutor?: TrustedBackendExecutor }
+  ): Promise<ResultPublicationRecord> {
     if (params.actorRole !== 'ORGANIZER') {
       throw new Error('Unauthorized: Only organizers can approve and publish official competition results.');
     }
@@ -819,8 +953,11 @@ class ResultsAndAnalyticsService {
       throw new Error('Organizer approval requires a documented confirmation note (minimum 5 characters).');
     }
 
-    const { competition, inputs } = await this.loadCompetitionScoringInputs(params.competitionId);
-    const policy = this.getScoringPolicy(params.competitionId);
+    const { competition, inputs } = await this.loadCompetitionScoringInputs(
+      params.competitionId,
+      options
+    );
+    const policy = await this.loadScoringPolicyFromFirestore(params.competitionId, options);
 
     const officialEntries = this.rankEntries({
       inputs,
@@ -835,16 +972,20 @@ class ResultsAndAnalyticsService {
       );
     }
 
-    const existing = this.publications.get(params.competitionId);
+    const existing =
+      (await this.getPublicationStatusFromFirestore(params.competitionId, options)) ||
+      this.publications.get(params.competitionId);
     const nextVersion = (existing?.version || 0) + 1;
     const now = new Date().toISOString();
 
-    const record: ResultPublicationRecord = {
+    const record: ResultPublicationRecord & { organizationId: string; isPublic: boolean } = {
       id: `pub-${params.competitionId}-v${nextVersion}`,
+      organizationId: competition.organizationId,
       competitionId: params.competitionId,
       competitionTitle: competition.title,
       publicSlug: competition.slug || params.competitionId,
       status: 'PUBLISHED',
+      isPublic: competition.visibility !== 'PRIVATE',
       version: nextVersion,
       policySnapshot: JSON.parse(JSON.stringify(policy)),
       entries: officialEntries,
@@ -855,10 +996,38 @@ class ResultsAndAnalyticsService {
       updatedAt: now,
     };
 
+    const executor = resolveTrustedExecutor(options);
+    if (executor) {
+      await executor.persistResultPublication(record);
+      await governanceAuditService.recordEventDurable(
+        {
+          organizationId: competition.organizationId,
+          competitionId: params.competitionId,
+          category: 'PUBLICATION_ACTION',
+          action: 'OFFICIAL_RESULTS_PUBLISHED',
+          actorId: params.organizerUserId,
+          actorName: params.organizerName,
+          actorRole: 'ORGANIZER',
+          targetId: record.id,
+          targetLabel: `${competition.title} Official Results v${nextVersion}`,
+          reason: params.approvalReason.trim(),
+          metadata: {
+            version: nextVersion,
+            rankedCount: officialEntries.length,
+            policyType: policy.policyType,
+            includeAiAsJudgeScore: policy.includeAiAsJudgeScore,
+          },
+        },
+        { trustedExecutor: executor }
+      );
+      this.publications.set(params.competitionId, record);
+      return record;
+    }
+
     this.publications.set(params.competitionId, record);
-    this.saveToStorage();
 
     governanceAuditService.recordEvent({
+      organizationId: competition.organizationId,
       competitionId: params.competitionId,
       category: 'PUBLICATION_ACTION',
       action: 'OFFICIAL_RESULTS_PUBLISHED',
@@ -880,15 +1049,18 @@ class ResultsAndAnalyticsService {
   }
 
   /**
-   * Unpublishes official results through an authorized organizer workflow (e.g., for corrections/disputes).
+   * Unpublishes official results through an authorized organizer workflow.
    */
-  public async unpublishOfficialResults(params: {
-    competitionId: string;
-    organizerUserId: string;
-    organizerName: string;
-    actorRole: 'ORGANIZER' | 'JUDGE' | 'PARTICIPANT';
-    reason: string;
-  }): Promise<ResultPublicationRecord> {
+  public async unpublishOfficialResults(
+    params: {
+      competitionId: string;
+      organizerUserId: string;
+      organizerName: string;
+      actorRole: 'ORGANIZER' | 'JUDGE' | 'PARTICIPANT';
+      reason: string;
+    },
+    options?: FirestoreExecutionOptions & { trustedExecutor?: TrustedBackendExecutor }
+  ): Promise<ResultPublicationRecord> {
     if (params.actorRole !== 'ORGANIZER') {
       throw new Error('Unauthorized: Only organizers can unpublish official results.');
     }
@@ -897,15 +1069,19 @@ class ResultsAndAnalyticsService {
       throw new Error('A documented justification (minimum 5 characters) is required to unpublish official results.');
     }
 
-    const existing = this.publications.get(params.competitionId);
+    const existing =
+      (await this.getPublicationStatusFromFirestore(params.competitionId, options)) ||
+      this.publications.get(params.competitionId);
     if (!existing || existing.status !== 'PUBLISHED') {
       throw new Error('Official results are not currently published for this competition.');
     }
 
     const now = new Date().toISOString();
-    const updated: ResultPublicationRecord = {
+    const updated: ResultPublicationRecord & { organizationId: string; isPublic: boolean } = {
       ...existing,
+      organizationId: existing.organizationId || 'unknown',
       status: 'UNPUBLISHED',
+      isPublic: false,
       unpublishedBy: params.organizerUserId,
       unpublishedByName: params.organizerName,
       unpublishedAt: now,
@@ -913,10 +1089,33 @@ class ResultsAndAnalyticsService {
       updatedAt: now,
     };
 
+    const executor = resolveTrustedExecutor(options);
+    if (executor) {
+      await executor.persistResultPublication(updated);
+      await governanceAuditService.recordEventDurable(
+        {
+          organizationId: updated.organizationId,
+          competitionId: params.competitionId,
+          category: 'PUBLICATION_ACTION',
+          action: 'OFFICIAL_RESULTS_UNPUBLISHED',
+          actorId: params.organizerUserId,
+          actorName: params.organizerName,
+          actorRole: 'ORGANIZER',
+          targetId: updated.id,
+          targetLabel: `${updated.competitionTitle} Official Results v${updated.version}`,
+          reason: params.reason.trim(),
+          metadata: { version: updated.version },
+        },
+        { trustedExecutor: executor }
+      );
+      this.publications.set(params.competitionId, updated);
+      return updated;
+    }
+
     this.publications.set(params.competitionId, updated);
-    this.saveToStorage();
 
     governanceAuditService.recordEvent({
+      organizationId: existing.organizationId,
       competitionId: params.competitionId,
       category: 'PUBLICATION_ACTION',
       action: 'OFFICIAL_RESULTS_UNPUBLISHED',
@@ -1001,12 +1200,109 @@ class ResultsAndAnalyticsService {
   }
 
   /**
-   * Returns published official results ONLY. Returns null if not published.
+   * Reads official publication record directly from Firestore `/resultPublications/{competitionId}`.
+   */
+  public async getPublicationStatusFromFirestore(
+    competitionId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<ResultPublicationRecord | null> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      try {
+        const snap = await getDoc(doc(fs, 'resultPublications', competitionId));
+        if (!snap.exists()) return null;
+        return snap.data() as ResultPublicationRecord;
+      } catch (err) {
+        throw mapFirestoreError(err, 'getPublicationStatusFromFirestore', 'resultPublications');
+      }
+    }
+    return this.publications.get(competitionId) || null;
+  }
+
+  /**
+   * Reads published public leaderboard directly from Firestore. Returns null if not PUBLISHED.
+   */
+  public async getPublicLeaderboardFromFirestore(
+    competitionId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<ResultPublicationRecord | null> {
+    const pub = await this.getPublicationStatusFromFirestore(competitionId, options);
+    if (!pub || pub.status !== 'PUBLISHED') {
+      return null;
+    }
+    const comp = await competitionService.getCompetition(competitionId, options);
+    if (comp?.policies?.isLeaderboardHidden) {
+      return null;
+    }
+    if (comp?.policies?.leaderboardPublishDate) {
+      const publishAt = new Date(comp.policies.leaderboardPublishDate).getTime();
+      if (Date.now() < publishAt) {
+        return null;
+      }
+    }
+    return pub;
+  }
+
+  /**
+   * Lists immutable leaderboard snapshots for a competition with bounded pagination.
+   */
+  public async listLeaderboardSnapshotsPaginated(
+    competitionId: string,
+    pagination?: PaginationOptions
+  ): Promise<PaginatedResult<ResultPublicationRecord>> {
+    const pageSize = clampPageSize(pagination?.pageSize);
+    const fs = resolveFirestore(pagination?.firestore);
+    if (fs) {
+      try {
+        const constraints: QueryConstraint[] = [
+          where('competitionId', '==', competitionId),
+          limit(pageSize + 1),
+        ];
+        if (pagination?.cursor) {
+          constraints.push(startAfter(pagination.cursor));
+        }
+        const snap = await getDocs(query(collection(fs, 'leaderboardSnapshots'), ...constraints));
+        const hasMore = snap.docs.length > pageSize;
+        const pageDocs = hasMore ? snap.docs.slice(0, pageSize) : snap.docs;
+        const items = pageDocs
+          .map((d) => d.data() as ResultPublicationRecord)
+          .sort((a, b) => (b.version || 0) - (a.version || 0));
+        return {
+          items,
+          hasMore,
+          nextCursor: hasMore ? pageDocs[pageDocs.length - 1] : null,
+          pageSize,
+        };
+      } catch (err) {
+        throw mapFirestoreError(err, 'listLeaderboardSnapshotsPaginated', 'leaderboardSnapshots');
+      }
+    }
+    const existing = this.publications.get(competitionId);
+    return {
+      items: existing ? [existing] : [],
+      hasMore: false,
+      nextCursor: null,
+      pageSize,
+    };
+  }
+
+  /**
+   * Returns published official results ONLY (sync cache helper for unit tests).
    */
   public getPublicLeaderboard(competitionId: string): ResultPublicationRecord | null {
     const pub = this.publications.get(competitionId);
     if (!pub || pub.status !== 'PUBLISHED') {
       return null;
+    }
+    const comp = competitionService.getCompetitionSync(competitionId);
+    if (comp?.policies?.isLeaderboardHidden) {
+      return null;
+    }
+    if (comp?.policies?.leaderboardPublishDate) {
+      const publishAt = new Date(comp.policies.leaderboardPublishDate).getTime();
+      if (Date.now() < publishAt) {
+        return null;
+      }
     }
     return pub;
   }
@@ -1086,13 +1382,17 @@ class ResultsAndAnalyticsService {
   // ─────────────────────────────────────────────
 
   public async computeCompetitionAnalytics(
-    competitionId: string
+    competitionId: string,
+    options?: FirestoreExecutionOptions
   ): Promise<CompetitionAnalyticsReport> {
     const { competition, inputs, allSubmissions, aiReports, allHumanEvaluations } =
-      await this.loadCompetitionScoringInputs(competitionId);
-    const policy = this.getScoringPolicy(competitionId);
-    const assignments = await judgeAssignmentService.listAssignments({ competitionId });
-    const judgeWorkload = await judgeAssignmentService.getJudgeWorkload(competitionId);
+      await this.loadCompetitionScoringInputs(competitionId, options);
+    const policy = await this.loadScoringPolicyFromFirestore(competitionId, options);
+    const assignments = await judgeAssignmentService.listAssignments({ competitionId }, options);
+    const judgeWorkload = await judgeAssignmentService.getJudgeWorkload(competitionId, {
+      firestore: options?.firestore,
+      organizationId: competition.organizationId,
+    });
 
     const totalSubmissions = allSubmissions.length;
     const validSubmissions = allSubmissions.filter((s) => s.status !== 'Draft').length;
@@ -1270,6 +1570,8 @@ class ResultsAndAnalyticsService {
    * command center with real multi-judge evaluations, ledger entries, and ties to test.
    */
   public async ensureDemoDataForUi(competitionId: string): Promise<void> {
+    // Strictly disabled in production or whenever real Firestore persistence is active
+    if (!isDemoModeEnabled() || resolveFirestore()) return;
     if (this.demoSeededCompetitions.has(competitionId)) return;
 
     const existingSubs = await submissionService.listCompetitionSubmissions(competitionId);
@@ -1595,14 +1897,6 @@ class ResultsAndAnalyticsService {
     this.policies.clear();
     this.publications.clear();
     this.demoSeededCompetitions.clear();
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        window.localStorage.removeItem(POLICY_STORAGE_KEY);
-        window.localStorage.removeItem(PUBLICATION_STORAGE_KEY);
-      }
-    } catch {
-      // Ignore
-    }
   }
 }
 

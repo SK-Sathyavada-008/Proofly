@@ -29,7 +29,12 @@ import { SubmissionConfirmationView } from '../../components/submission/Submissi
 import { formBuilderService } from '../../services/formBuilderService';
 import { accessManagementService } from '../../services/accessManagementService';
 import { submissionService } from '../../services/submissionService';
-import { fileStorageService } from '../../services/fileStorageService';
+import {
+  fileStorageService,
+  OFFICIAL_SUPPORTED_FORMATS,
+  type UploadProgressState,
+} from '../../services/fileStorageService';
+import { useProoflyAuth } from '../../context/ProoflyAuthContext';
 import type { Competition } from '../../types/authAndCompetition';
 import type { SubmissionFormField, SubmissionSessionToken } from '../../types/formAndAccess';
 import type { SubmissionCreationResult, StoredFileMetadata } from '../../types/submission';
@@ -37,6 +42,7 @@ import type { SubmissionCreationResult, StoredFileMetadata } from '../../types/s
 export const ParticipantSubmissionPage: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
+  const { currentUser } = useProoflyAuth();
   const { success, error: toastError } = useToast();
 
   const codeParam = searchParams.get('code') || '';
@@ -71,8 +77,11 @@ export const ParticipantSubmissionPage: React.FC = () => {
   const [dynamicValues] = useState<Record<string, any>>({});
 
   // Files
+  const [draftSubmissionId] = useState<string>(() => `sub_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`);
   const [uploadedFiles, setUploadedFiles] = useState<StoredFileMetadata[]>([]);
   const [isUploadingFile, setIsUploadingFile] = useState(false);
+  const [uploadProgressMap, setUploadProgressMap] = useState<Record<string, UploadProgressState>>({});
+  const [failedUploads, setFailedUploads] = useState<Array<{ fileName: string; error: string }>>([]);
 
   // Submission Flow
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -167,50 +176,74 @@ export const ParticipantSubmissionPage: React.FC = () => {
     setTechnologiesUsed(technologiesUsed.filter((t) => t !== tag));
   };
 
-  // File Upload with Magic Byte Inspection & Batch Multi-File Support
+  // File Upload with Real Firebase Storage, Magic Byte Inspection, Progress & Failure Guard
   const handleFileUpload = async (field: SubmissionFormField, fileList: FileList | null) => {
     if (!fileList || fileList.length === 0 || !competition) return;
     setIsUploadingFile(true);
+    setFailedUploads([]);
 
-    const allowed = field.validation.fileTypeRestrictions ||
-      field.validation.fileExtensions || [
-        '.pdf', '.ppt', '.pptx', '.doc', '.docx', '.zip', '.tar', '.gz',
-        '.png', '.jpg', '.jpeg', '.gif', '.webp', '.txt', '.md', '.csv', '.json',
-      ];
-    const maxSize = field.validation.maxFileSizeMb || 50;
+    const officialExts = Object.keys(OFFICIAL_SUPPORTED_FORMATS);
+    const configuredAllowed = field.validation.fileTypeRestrictions || field.validation.fileExtensions;
+    const allowed = configuredAllowed
+      ? configuredAllowed.filter((ext) => {
+          const norm = ext.startsWith('.') ? ext.toLowerCase() : `.${ext.toLowerCase()}`;
+          return Boolean(OFFICIAL_SUPPORTED_FORMATS[norm]);
+        })
+      : officialExts;
+    const backendCap = fileStorageService.getActiveMaxFileSizeMb();
+    const maxSize = Math.min(field.validation.maxFileSizeMb || backendCap, backendCap);
 
-    const newFiles: StoredFileMetadata[] = [];
-    const errors: string[] = [];
-
-    for (let i = 0; i < fileList.length; i++) {
-      const file = fileList[i];
+    const uploadPromises = Array.from(fileList).map(async (file) => {
       try {
         const metadata = await fileStorageService.uploadFile(file, {
           fieldId: field.id,
+          organizationId: competition.organizationId,
           competitionId: competition.id,
-          submissionId: `temp_${Date.now()}_${i}_${Math.random().toString(36).substring(2, 7)}`,
-          allowedExtensions: allowed,
+          submissionId: draftSubmissionId,
+          uploaderUid: currentUser?.uid,
+          participantSessionId: session?.sessionToken,
+          allowedExtensions: allowed.length > 0 ? allowed : officialExts,
           maxSizeMb: maxSize,
+          existingFiles: uploadedFiles,
+          onProgress: (progress) => {
+            setUploadProgressMap((prev) => ({ ...prev, [progress.fileId]: progress }));
+          },
         });
-        newFiles.push(metadata);
+        return { success: true as const, metadata };
       } catch (err: any) {
-        errors.push(`${file.name}: ${err?.message || 'Upload failed'}`);
+        return { success: false as const, fileName: file.name, error: err?.message || 'Upload failed' };
+      }
+    });
+
+    const results = await Promise.all(uploadPromises);
+    const newFiles: StoredFileMetadata[] = [];
+    const errors: Array<{ fileName: string; error: string }> = [];
+
+    for (const res of results) {
+      if (res.success) {
+        newFiles.push(res.metadata);
+      } else {
+        errors.push({ fileName: res.fileName, error: res.error });
       }
     }
 
     if (newFiles.length > 0) {
       setUploadedFiles((prev) => [...prev, ...newFiles]);
       if (newFiles.length === 1) {
-        success('File Uploaded & Verified', `${newFiles[0].fileName} uploaded and verified.`);
+        success('File Uploaded & Verified', `${newFiles[0].fileName} persisted securely.`);
       } else {
-        success('Files Uploaded & Verified', `Successfully uploaded and verified ${newFiles.length} files.`);
+        success('Files Uploaded & Verified', `${newFiles.length} files persisted securely.`);
       }
     }
 
     if (errors.length > 0) {
+      setFailedUploads(errors);
       toastError(
-        errors.length === 1 ? 'File Upload Issue' : `${errors.length} Files Rejected`,
-        errors.slice(0, 3).join('; ') + (errors.length > 3 ? ` (+${errors.length - 3} more)` : '')
+        errors.length === 1 ? 'File Upload Failed' : `${errors.length} File Uploads Failed`,
+        errors
+          .slice(0, 3)
+          .map((e) => `${e.fileName}: ${e.error}`)
+          .join('; ') + (errors.length > 3 ? ` (+${errors.length - 3} more)` : '')
       );
     }
 
@@ -225,6 +258,28 @@ export const ParticipantSubmissionPage: React.FC = () => {
   const handleSaveOrSubmit = async (isDraft: boolean) => {
     if (!competition || !session) {
       toastError('Session Required', 'Please enter a valid competition access code.');
+      return;
+    }
+
+    if (isUploadingFile) {
+      toastError('Upload In Progress', 'Wait for all file uploads to finish before submitting.');
+      return;
+    }
+
+    if (!isDraft && failedUploads.length > 0) {
+      toastError(
+        'Unresolved Upload Failure',
+        'One or more file uploads failed. Retry uploading valid files or clear failed items before submitting.'
+      );
+      return;
+    }
+
+    const unverifiedFile = uploadedFiles.find((f) => !f.isVerified || f.uploadStatus !== 'UPLOADED');
+    if (!isDraft && unverifiedFile) {
+      toastError(
+        'Unverified Attachment',
+        `File "${unverifiedFile.fileName}" has not completed verified upload to Firebase Storage.`
+      );
       return;
     }
 
@@ -749,15 +804,9 @@ export const ParticipantSubmissionPage: React.FC = () => {
                     order: 99,
                     visibility: 'PUBLIC',
                     validation: {
-                      fileTypeRestrictions: [
-                        '.pdf', '.ppt', '.pptx', '.doc', '.docx', '.zip', '.tar', '.gz',
-                        '.png', '.jpg', '.jpeg', '.gif', '.webp', '.txt', '.md', '.csv', '.json',
-                      ],
-                      fileExtensions: [
-                        '.pdf', '.ppt', '.pptx', '.doc', '.docx', '.zip', '.tar', '.gz',
-                        '.png', '.jpg', '.jpeg', '.gif', '.webp', '.txt', '.md', '.csv', '.json',
-                      ],
-                      maxFileSizeMb: 50,
+                      fileTypeRestrictions: Object.keys(OFFICIAL_SUPPORTED_FORMATS),
+                      fileExtensions: Object.keys(OFFICIAL_SUPPORTED_FORMATS),
+                      maxFileSizeMb: 25,
                       required: false,
                     },
                   };
@@ -773,7 +822,7 @@ export const ParticipantSubmissionPage: React.FC = () => {
                   Drag and drop multiple files (Presentations, PDFs, Code ZIPs, Screenshots)
                 </p>
                 <p className="text-[11px] text-slate-400 dark:text-slate-500">
-                  Supported formats: PDF, PPT/PPTX, DOC/DOCX, ZIP, PNG, JPG, MD, TXT (Max 50MB per file)
+                  Supported formats: PDF, PPT/PPTX, ZIP, PNG, JPG, WEBP, MD, TXT, JSON (Max {fileStorageService.getActiveMaxFileSizeMb()}MB per file)
                 </p>
               </div>
 
@@ -782,7 +831,7 @@ export const ParticipantSubmissionPage: React.FC = () => {
                 multiple
                 id="file-upload-input"
                 className="hidden"
-                accept=".pdf,.ppt,.pptx,.doc,.docx,.zip,.tar,.gz,.png,.jpg,.jpeg,.gif,.webp,.txt,.md,.csv,.json,application/pdf,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/zip,application/x-zip-compressed,image/*,text/*"
+                accept=".pdf,.ppt,.pptx,.zip,.png,.jpg,.jpeg,.webp,.txt,.md,.json,application/pdf,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/zip,image/png,image/jpeg,image/webp,text/plain,text/markdown,application/json"
                 onClick={(e) => e.stopPropagation()}
                 onChange={(e) => {
                   const dummyField: SubmissionFormField = {
@@ -793,15 +842,9 @@ export const ParticipantSubmissionPage: React.FC = () => {
                     order: 99,
                     visibility: 'PUBLIC',
                     validation: {
-                      fileTypeRestrictions: [
-                        '.pdf', '.ppt', '.pptx', '.doc', '.docx', '.zip', '.tar', '.gz',
-                        '.png', '.jpg', '.jpeg', '.gif', '.webp', '.txt', '.md', '.csv', '.json',
-                      ],
-                      fileExtensions: [
-                        '.pdf', '.ppt', '.pptx', '.doc', '.docx', '.zip', '.tar', '.gz',
-                        '.png', '.jpg', '.jpeg', '.gif', '.webp', '.txt', '.md', '.csv', '.json',
-                      ],
-                      maxFileSizeMb: 50,
+                      fileTypeRestrictions: Object.keys(OFFICIAL_SUPPORTED_FORMATS),
+                      fileExtensions: Object.keys(OFFICIAL_SUPPORTED_FORMATS),
+                      maxFileSizeMb: 25,
                       required: false,
                     },
                   };
@@ -822,6 +865,51 @@ export const ParticipantSubmissionPage: React.FC = () => {
                 Browse & Select Multiple Files
               </Button>
             </div>
+
+            {/* In-Flight Progress & Failed Upload Notices */}
+            {Object.values(uploadProgressMap).some((p) => p.state === 'running') && (
+              <div className="space-y-1.5">
+                {Object.values(uploadProgressMap)
+                  .filter((p) => p.state === 'running')
+                  .map((p) => (
+                    <div
+                      key={p.fileId}
+                      className="px-3 py-2 rounded-lg border border-blue-200 dark:border-blue-500/30 bg-blue-50/60 dark:bg-blue-500/10 text-xs flex items-center justify-between gap-2"
+                    >
+                      <span className="truncate text-blue-900 dark:text-blue-200">
+                        Uploading {p.fileName} ({p.percent}%)
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => fileStorageService.cancelUpload(p.fileId)}
+                        className="text-[11px] font-medium text-rose-600 dark:text-rose-400 hover:underline cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  ))}
+              </div>
+            )}
+
+            {failedUploads.length > 0 && (
+              <div className="px-3 py-2.5 rounded-lg border border-rose-200 dark:border-rose-500/30 bg-rose-50 dark:bg-rose-500/10 text-xs text-rose-800 dark:text-rose-200 space-y-1">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold">Failed uploads (must resolve before submitting):</span>
+                  <button
+                    type="button"
+                    onClick={() => setFailedUploads([])}
+                    className="text-[11px] underline cursor-pointer"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+                {failedUploads.map((item, idx) => (
+                  <p key={idx} className="text-[11px]">
+                    • {item.fileName}: {item.error}
+                  </p>
+                ))}
+              </div>
+            )}
 
             {/* Uploaded Files List */}
             {uploadedFiles.length > 0 && (

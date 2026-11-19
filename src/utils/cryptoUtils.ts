@@ -39,6 +39,21 @@ export async function sha256Hash(input: string): Promise<string> {
 }
 
 /**
+ * Computes a genuine full-file SHA-256 hex digest over raw binary bytes.
+ */
+export async function sha256Bytes(bytes: Uint8Array): Promise<string> {
+  if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle) {
+    const bufferCopy = new Uint8Array(bytes.byteLength);
+    bufferCopy.set(bytes);
+    const hashBuffer = await globalThis.crypto.subtle.digest('SHA-256', bufferCopy.buffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  throw new Error('Web Crypto API (crypto.subtle) is required for binary SHA-256 hashing.');
+}
+
+/**
  * Constant-time string comparison to prevent timing attacks.
  */
 export function timingSafeEqualStrings(a: string, b: string): boolean {

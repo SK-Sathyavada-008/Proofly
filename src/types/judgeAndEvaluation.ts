@@ -3,7 +3,7 @@
 // Proofly / Evalora — Multi-Judge Coordination, Workload, & Immutability
 // ─────────────────────────────────────────────
 
-export type JudgeAssignmentStatus = 'PENDING' | 'IN_PROGRESS' | 'COMPLETED' | 'CONFLICT';
+export type JudgeAssignmentStatus = 'PENDING' | 'IN_PROGRESS' | 'COMPLETED' | 'CONFLICT' | 'REVOKED';
 
 export type JudgeDecisionMode = 'AGREE' | 'MODIFY' | 'REJECT';
 
@@ -41,8 +41,12 @@ export interface ReassignmentAudit {
   reason: string;
 }
 
+export type JudgeAssignmentSource = 'MANUAL' | 'BATCH' | 'AUTO_BALANCED' | 'REASSIGNMENT';
+
 export interface JudgeRecord {
   id: string; // User UID or unique judge ID
+  userId?: string; // Firebase Auth UID for profile ownership matching
+  organizationId?: string;
   name: string;
   email: string;
   title?: string;
@@ -58,6 +62,7 @@ export interface JudgeRecord {
 
 export interface JudgeAssignment {
   id: string;
+  organizationId?: string;
   competitionId: string;
   roundId?: string;
   submissionId: string;
@@ -70,6 +75,7 @@ export interface JudgeAssignment {
   assignedBy: string;
   assignedByName: string;
   assignedAt: string;
+  assignmentSource?: JudgeAssignmentSource;
   deadline?: string; // ISO date string
   status: JudgeAssignmentStatus;
   conflict?: ConflictDeclaration;
@@ -111,6 +117,7 @@ export interface ReopenAuditRecord {
 export interface HumanJudgeEvaluation {
   id: string;
   assignmentId?: string;
+  organizationId?: string;
   submissionId: string;
   referenceId: string;
   competitionId: string;
@@ -118,10 +125,14 @@ export interface HumanJudgeEvaluation {
   judgeId: string;
   judgeName: string;
   judgeEmail: string;
-  
+  source?: 'HUMAN';
+  rubricVersion?: number;
+
   // Score comparisons
   decisionMode: JudgeDecisionMode;
   scores: Record<string, number>; // criterionId -> humanScore
+  criterionComments?: Record<string, string>; // criterionId -> per-criterion comment
+  overallComments?: string;
   totalScore: number; // Human total
   aiTotalScore: number; // Preserved original AI score
   scoreDifference: number; // totalScore - aiTotalScore
@@ -142,6 +153,9 @@ export interface HumanJudgeEvaluation {
 
   // Reopen audit trail
   reopenHistory: ReopenAuditRecord[];
+  reopenReason?: string;
+  reopenedBy?: string;
+  reopenedAt?: string;
 
   evaluatorVersion: number;
   createdAt: string;

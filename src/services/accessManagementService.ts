@@ -8,13 +8,21 @@ import {
   doc,
   getDoc,
   getDocs,
+  limit,
   setDoc,
   updateDoc,
   query,
   where,
 } from 'firebase/firestore';
-import { db, isFirebaseConfigured } from '../config/firebase';
 import { sanitizeFirestoreData } from '../utils/firestoreUtils';
+import {
+  clampPageSize,
+  mapFirestoreError,
+  resolveFirestore,
+  withServerTimestamps,
+  type FirestoreExecutionOptions,
+  type PaginationOptions,
+} from './firestorePersistenceService';
 import type {
   CompetitionAccessKey,
   AccessValidationResult,
@@ -24,37 +32,9 @@ import { competitionService } from './competitionService';
 import { formBuilderService } from './formBuilderService';
 import { generateSecureToken, sha256Hash, timingSafeEqualStrings } from '../utils/cryptoUtils';
 
-const ACCESS_KEYS_STORAGE_KEY = 'proofly_access_keys_v1';
-
-// Local in-memory store for fallback/tests
+// Unit-test-only in-memory stores (unused whenever Firestore is active)
 let localAccessKeys: CompetitionAccessKey[] = [];
 let localActiveSessions: Record<string, SubmissionSessionToken> = {};
-
-function loadAccessKeysFromStorage(): void {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    const raw = window.localStorage.getItem(ACCESS_KEYS_STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        localAccessKeys = parsed;
-      }
-    }
-  } catch {
-    // Ignore storage errors
-  }
-}
-
-function saveAccessKeysToStorage(): void {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    window.localStorage.setItem(ACCESS_KEYS_STORAGE_KEY, JSON.stringify(localAccessKeys));
-  } catch {
-    // Ignore storage errors
-  }
-}
-
-loadAccessKeysFromStorage();
 
 // Sliding-window rate limiter against anonymous access-code brute forcing
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -127,16 +107,23 @@ export const accessManagementService = {
       updatedAt: now,
     };
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore();
+    if (fs) {
       try {
-        await setDoc(doc(db, 'accessKeys', keyId), sanitizeFirestoreData(newKey));
-      } catch {
-        // Fallback to local store
+        await setDoc(
+          doc(fs, 'accessKeys', keyId),
+          withServerTimestamps(
+            sanitizeFirestoreData({ ...newKey, organizationId: comp.organizationId }),
+            true
+          )
+        );
+        return newKey;
+      } catch (err) {
+        throw mapFirestoreError(err, 'getOrCreatePublicAccessKey', 'accessKeys');
       }
     }
 
     localAccessKeys.push(newKey);
-    saveAccessKeysToStorage();
     return newKey;
   },
 
@@ -192,15 +179,22 @@ export const accessManagementService = {
       updatedAt: now,
     };
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore();
+    if (fs) {
       try {
-        await setDoc(doc(db, 'accessKeys', keyId), sanitizeFirestoreData(accessKey));
-      } catch {
-        // Fallback to local store
+        await setDoc(
+          doc(fs, 'accessKeys', keyId),
+          withServerTimestamps(
+            sanitizeFirestoreData({ ...accessKey, organizationId: comp.organizationId }),
+            true
+          )
+        );
+      } catch (err) {
+        throw mapFirestoreError(err, 'generateIndividualLink', 'accessKeys');
       }
+    } else {
+      localAccessKeys.push(accessKey);
     }
-    localAccessKeys.push(accessKey);
-    saveAccessKeysToStorage();
 
     const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:5173';
     const directSubmissionUrl = `${origin}/submit?token=${rawToken}&comp=${competitionId}`;
@@ -240,16 +234,20 @@ export const accessManagementService = {
         code: newCode,
         updatedAt: now,
       };
-      if (isFirebaseConfigured() && db) {
+      const fs = resolveFirestore();
+      if (fs) {
         try {
-          await updateDoc(doc(db, 'accessKeys', publicKey.id), updated as any);
-        } catch {
-          // Fallback to local store
+          await updateDoc(
+            doc(fs, 'accessKeys', publicKey.id),
+            withServerTimestamps(sanitizeFirestoreData(updated), false)
+          );
+          return updated;
+        } catch (err) {
+          throw mapFirestoreError(err, 'regenerateAccessCode', 'accessKeys');
         }
       }
       const idx = localAccessKeys.findIndex((k) => k.id === publicKey.id);
       if (idx !== -1) localAccessKeys[idx] = updated;
-      saveAccessKeysToStorage();
       return updated;
     }
 
@@ -272,17 +270,21 @@ export const accessManagementService = {
       updatedAt: new Date().toISOString(),
     };
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore();
+    if (fs) {
       try {
-        await updateDoc(doc(db, 'accessKeys', keyId), updated as any);
-      } catch {
-        // Fallback to local store
+        await updateDoc(
+          doc(fs, 'accessKeys', keyId),
+          withServerTimestamps(sanitizeFirestoreData(updated), false)
+        );
+        return updated;
+      } catch (err) {
+        throw mapFirestoreError(err, 'revokeAccessKey', 'accessKeys');
       }
     }
 
     const idx = localAccessKeys.findIndex((k) => k.id === keyId);
     if (idx !== -1) localAccessKeys[idx] = updated;
-    saveAccessKeysToStorage();
 
     return updated;
   },
@@ -290,26 +292,30 @@ export const accessManagementService = {
   /**
    * Updates submission limits on an access key.
    */
-  async setSubmissionLimit(keyId: string, limit: number): Promise<CompetitionAccessKey> {
+  async setSubmissionLimit(keyId: string, limitValue: number): Promise<CompetitionAccessKey> {
     const key = await this.getAccessKey(keyId);
     if (!key) throw new Error(`Access key "${keyId}" not found.`);
 
     const updated: CompetitionAccessKey = {
       ...key,
-      maxSubmissions: limit,
+      maxSubmissions: limitValue,
       updatedAt: new Date().toISOString(),
     };
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore();
+    if (fs) {
       try {
-        await updateDoc(doc(db, 'accessKeys', keyId), updated as any);
-      } catch {
-        // Fallback to local store
+        await updateDoc(
+          doc(fs, 'accessKeys', keyId),
+          withServerTimestamps(sanitizeFirestoreData(updated), false)
+        );
+        return updated;
+      } catch (err) {
+        throw mapFirestoreError(err, 'setSubmissionLimit', 'accessKeys');
       }
     }
     const idx = localAccessKeys.findIndex((k) => k.id === keyId);
     if (idx !== -1) localAccessKeys[idx] = updated;
-    saveAccessKeysToStorage();
 
     return updated;
   },
@@ -327,16 +333,20 @@ export const accessManagementService = {
       updatedAt: new Date().toISOString(),
     };
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore();
+    if (fs) {
       try {
-        await updateDoc(doc(db, 'accessKeys', keyId), updated as any);
-      } catch {
-        // Fallback to local store
+        await updateDoc(
+          doc(fs, 'accessKeys', keyId),
+          withServerTimestamps(sanitizeFirestoreData(updated), false)
+        );
+        return updated;
+      } catch (err) {
+        throw mapFirestoreError(err, 'setExpiration', 'accessKeys');
       }
     }
     const idx = localAccessKeys.findIndex((k) => k.id === keyId);
     if (idx !== -1) localAccessKeys[idx] = updated;
-    saveAccessKeysToStorage();
 
     return updated;
   },
@@ -344,43 +354,45 @@ export const accessManagementService = {
   /**
    * Retrieves an access key by ID.
    */
-  async getAccessKey(keyId: string): Promise<CompetitionAccessKey | null> {
-    if (isFirebaseConfigured() && db) {
+  async getAccessKey(
+    keyId: string,
+    options?: FirestoreExecutionOptions
+  ): Promise<CompetitionAccessKey | null> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
       try {
-        const snap = await getDoc(doc(db, 'accessKeys', keyId));
-        if (snap.exists()) {
-          return snap.data() as CompetitionAccessKey;
-        }
-      } catch {
-        // Fallback to local store
+        const snap = await getDoc(doc(fs, 'accessKeys', keyId));
+        return snap.exists() ? (snap.data() as CompetitionAccessKey) : null;
+      } catch (err) {
+        throw mapFirestoreError(err, 'getAccessKey', 'accessKeys');
       }
     }
     return localAccessKeys.find((k) => k.id === keyId) || null;
   },
 
   /**
-   * Lists all access keys for a given competition.
+   * Lists all access keys for a given competition (bounded via limit()).
    */
-  async listAccessKeys(competitionId: string): Promise<CompetitionAccessKey[]> {
-    const list: CompetitionAccessKey[] = localAccessKeys.filter((k) => k.competitionId === competitionId);
-    if (isFirebaseConfigured() && db) {
+  async listAccessKeys(
+    competitionId: string,
+    options?: PaginationOptions
+  ): Promise<CompetitionAccessKey[]> {
+    const fs = resolveFirestore(options?.firestore);
+    if (fs) {
+      const pageSize = clampPageSize(options?.pageSize);
       try {
-        const q = query(collection(db, 'accessKeys'), where('competitionId', '==', competitionId));
+        const q = query(
+          collection(fs, 'accessKeys'),
+          where('competitionId', '==', competitionId),
+          limit(pageSize)
+        );
         const snap = await getDocs(q);
-        snap.forEach((docSnap) => {
-          const item = docSnap.data() as CompetitionAccessKey;
-          const idx = list.findIndex((k) => k.id === item.id);
-          if (idx >= 0) {
-            list[idx] = item;
-          } else {
-            list.push(item);
-          }
-        });
-      } catch {
-        // Fallback to local store
+        return snap.docs.map((d) => d.data() as CompetitionAccessKey);
+      } catch (err) {
+        throw mapFirestoreError(err, 'listAccessKeys', 'accessKeys');
       }
     }
-    return list;
+    return localAccessKeys.filter((k) => k.competitionId === competitionId);
   },
 
   /**
@@ -396,19 +408,23 @@ export const accessManagementService = {
       updatedAt: new Date().toISOString(),
     };
 
-    if (isFirebaseConfigured() && db) {
+    const fs = resolveFirestore();
+    if (fs) {
       try {
-        await updateDoc(doc(db, 'accessKeys', keyId), {
-          submissionsCount: updated.submissionsCount,
-          updatedAt: updated.updatedAt,
-        });
-      } catch {
-        // Fallback to local store
+        await updateDoc(
+          doc(fs, 'accessKeys', keyId),
+          withServerTimestamps(
+            { submissionsCount: updated.submissionsCount, updatedAt: updated.updatedAt },
+            false
+          )
+        );
+        return;
+      } catch (err) {
+        throw mapFirestoreError(err, 'recordSubmissionUsage', 'accessKeys');
       }
     }
     const idx = localAccessKeys.findIndex((k) => k.id === keyId);
     if (idx !== -1) localAccessKeys[idx] = updated;
-    saveAccessKeysToStorage();
   },
 
   /**
@@ -487,27 +503,37 @@ export const accessManagementService = {
       };
     }
 
+    if (comp.status === 'SUBMISSIONS_CLOSED') {
+      const msg = `Submissions are currently closed for "${comp.title}".`;
+      return {
+        valid: false,
+        reason: msg,
+        error: msg,
+      };
+    }
+
     if (comp.status === 'DRAFT') {
-      // Auto-activate valid draft competition when accessed with the direct access code
       try {
         await competitionService.transitionStatus(comp.id, 'ACTIVE');
         comp.status = 'ACTIVE';
       } catch {
-        const msg = `Competition "${comp.title}" is currently in DRAFT mode and has not been launched yet. In the Organizer portal, please click "Launch (Activate)" on the Competitions page to open submissions.`;
-        return {
-          valid: false,
-          reason: msg,
-          error: msg,
-        };
+        // Safe fallback in live Firestore when caller has read-only access
       }
     }
 
     // 2. Locate Access Key
-    const allKeys = await this.listAccessKeys(competitionId);
+    const upperInput = trimmedInput.toUpperCase();
     let matchedKey: CompetitionAccessKey | null = null;
 
-    // Check if input matches public code (e.g. PF-HYBRID26 or comp.publicAccessCode)
-    const upperInput = trimmedInput.toUpperCase();
+    let allKeys: CompetitionAccessKey[] = [];
+    try {
+      allKeys = await this.listAccessKeys(competitionId);
+    } catch {
+      // Anonymous participants without organizer role cannot list all keys in the competition;
+      // fallback to memory/token validation
+      allKeys = localAccessKeys.filter((k) => k.competitionId === competitionId);
+    }
+
     const publicMatch = allKeys.find(
       (k) =>
         (k.scopeType === 'PUBLIC_LINK' || k.scopeType === 'ACCESS_CODE') &&
@@ -518,11 +544,11 @@ export const accessManagementService = {
       matchedKey = publicMatch;
     } else if (comp.publicAccessCode && comp.publicAccessCode.toUpperCase() === upperInput) {
       // Direct match against competition's public access code!
-      // Synthesize/provision key so that any valid competition access code works instantly
+      // Provision synthetic key so that any valid competition access code works instantly
       matchedKey = {
         id: `key-pub-${comp.id}`,
         competitionId: comp.id,
-        scopeType: 'ACCESS_CODE',
+        scopeType: 'PUBLIC_LINK',
         code: comp.publicAccessCode,
         label: 'Public Competition Access Code',
         submissionsCount: 0,
@@ -657,26 +683,7 @@ export const accessManagementService = {
    * Increments the submissionsCount for the access key.
    */
   async recordSubmissionUse(keyId: string): Promise<void> {
-    const key = await this.getAccessKey(keyId);
-    if (!key) return;
-    const updated = {
-      ...key,
-      submissionsCount: (key.submissionsCount || 0) + 1,
-      updatedAt: new Date().toISOString(),
-    };
-    if (isFirebaseConfigured() && db) {
-      try {
-        await updateDoc(doc(db, 'accessKeys', keyId), {
-          submissionsCount: updated.submissionsCount,
-          updatedAt: updated.updatedAt,
-        });
-      } catch {
-        // fallback
-      }
-    }
-    const idx = localAccessKeys.findIndex((k) => k.id === keyId);
-    if (idx !== -1) localAccessKeys[idx] = updated;
-    saveAccessKeysToStorage();
+    await this.recordSubmissionUsage(keyId);
   },
 
   /**

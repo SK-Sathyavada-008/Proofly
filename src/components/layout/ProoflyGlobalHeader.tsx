@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { NavLink, useLocation, useNavigate } from 'react-router-dom';
-import { ChevronDown, Check, Sun, Moon } from 'lucide-react';
+import { NavLink, Link, useLocation, useNavigate } from 'react-router-dom';
+import { ChevronDown, Check, Sun, Moon, LogOut, LogIn } from 'lucide-react';
 import { useProoflyAuth } from '../../context/ProoflyAuthContext';
 import { useTheme } from '../../context/ThemeContext';
 
@@ -9,10 +9,13 @@ export const ProoflyGlobalHeader: React.FC = () => {
   const navigate = useNavigate();
   const {
     currentUser,
+    isAuthenticated,
     activeOrganization,
+    activeOrgRole,
     userOrganizations,
+    competitionRoles,
     switchOrganization,
-    loginDemoUser,
+    logout,
   } = useProoflyAuth();
   const { theme, toggleTheme } = useTheme();
 
@@ -52,8 +55,30 @@ export const ProoflyGlobalHeader: React.FC = () => {
     { label: 'AI Runtime', to: '/ai-test', match: /^\/ai-test/ },
   ];
 
-  const isJudgePersona = currentUser?.uid === 'user-judge-demo';
-  const initials = isJudgePersona ? 'JD' : 'OR';
+  const computeInitials = (name?: string | null, email?: string | null) => {
+    const src = (name || email || 'U').trim();
+    const parts = src.split(/\s+/).filter(Boolean);
+    if (parts.length >= 2) {
+      return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+    }
+    return src.slice(0, 2).toUpperCase();
+  };
+
+  const roleLabel = (() => {
+    if (!currentUser) return '';
+    if (currentUser.platformRole === 'SUPER_ADMIN') return 'Platform Admin';
+    if (activeOrgRole === 'OWNER') return 'Org Owner';
+    if (activeOrgRole === 'ADMIN') return 'Org Admin';
+    const compRoleValues = Object.values(competitionRoles);
+    if (compRoleValues.includes('COMPETITION_ADMIN')) return 'Competition Admin';
+    if (compRoleValues.includes('ORGANIZER')) return 'Organizer';
+    if (compRoleValues.includes('JUDGE')) return 'Judge';
+    if (compRoleValues.includes('VIEWER')) return 'Viewer';
+    if (activeOrgRole === 'MEMBER') return 'Member';
+    return 'Account';
+  })();
+
+  const initials = computeInitials(currentUser?.displayName, currentUser?.email);
   const isDark = theme === 'dark';
 
   return (
@@ -70,56 +95,60 @@ export const ProoflyGlobalHeader: React.FC = () => {
             </span>
           </NavLink>
 
-          <span className="text-slate-300 dark:text-slate-700 text-sm hidden sm:inline select-none">/</span>
+          {isAuthenticated && userOrganizations.length > 0 && (
+            <>
+              <span className="text-slate-300 dark:text-slate-700 text-sm hidden sm:inline select-none">/</span>
 
-          {/* Organization Dropdown */}
-          <div className="relative hidden sm:block" ref={dropdownRef}>
-            <button
-              type="button"
-              onClick={() => setIsOrgDropdownOpen(!isOrgDropdownOpen)}
-              aria-expanded={isOrgDropdownOpen}
-              className="flex items-center gap-1.5 px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-300 transition-colors duration-150 cursor-pointer"
-            >
-              <span className="truncate max-w-[160px] md:max-w-[200px]">
-                {activeOrganization?.name || 'Organization'}
-              </span>
-              <ChevronDown
-                size={13}
-                className={`text-slate-400 dark:text-slate-500 shrink-0 transition-transform duration-150 ${
-                  isOrgDropdownOpen ? 'rotate-180' : ''
-                }`}
-              />
-            </button>
+              {/* Organization Dropdown */}
+              <div className="relative hidden sm:block" ref={dropdownRef}>
+                <button
+                  type="button"
+                  onClick={() => setIsOrgDropdownOpen(!isOrgDropdownOpen)}
+                  aria-expanded={isOrgDropdownOpen}
+                  className="flex items-center gap-1.5 px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-300 transition-colors duration-150 cursor-pointer"
+                >
+                  <span className="truncate max-w-[160px] md:max-w-[200px]">
+                    {activeOrganization?.name || 'Organization'}
+                  </span>
+                  <ChevronDown
+                    size={13}
+                    className={`text-slate-400 dark:text-slate-500 shrink-0 transition-transform duration-150 ${
+                      isOrgDropdownOpen ? 'rotate-180' : ''
+                    }`}
+                  />
+                </button>
 
-            {isOrgDropdownOpen && (
-              <div className="proofly-dropdown-left absolute left-0 mt-1.5 w-64 rounded-lg bg-white dark:bg-[#161F30] border border-slate-200 dark:border-slate-700/80 shadow-lg dark:shadow-black/40 py-1 z-50">
-                <div className="px-3 py-1.5 text-[11px] font-medium text-slate-400 dark:text-slate-500 border-b border-slate-100 dark:border-slate-800">
-                  Organizations
-                </div>
-                {userOrganizations.map((org) => {
-                  const isSelected = org.id === activeOrganization?.id;
-                  return (
-                    <button
-                      key={org.id}
-                      type="button"
-                      onClick={() => {
-                        switchOrganization(org.id);
-                        setIsOrgDropdownOpen(false);
-                      }}
-                      className={`w-full flex items-center justify-between px-3 py-2 text-xs text-left transition-colors duration-150 cursor-pointer ${
-                        isSelected
-                          ? 'bg-slate-50 dark:bg-slate-800/80 text-slate-900 dark:text-slate-100 font-medium'
-                          : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/50 hover:text-slate-900 dark:hover:text-slate-100'
-                      }`}
-                    >
-                      <span className="truncate">{org.name}</span>
-                      {isSelected && <Check size={13} className="text-blue-600 dark:text-blue-400 shrink-0 ml-2" />}
-                    </button>
-                  );
-                })}
+                {isOrgDropdownOpen && (
+                  <div className="proofly-dropdown-left absolute left-0 mt-1.5 w-64 rounded-lg bg-white dark:bg-[#161F30] border border-slate-200 dark:border-slate-700/80 shadow-lg dark:shadow-black/40 py-1 z-50">
+                    <div className="px-3 py-1.5 text-[11px] font-medium text-slate-400 dark:text-slate-500 border-b border-slate-100 dark:border-slate-800">
+                      Organizations
+                    </div>
+                    {userOrganizations.map((org) => {
+                      const isSelected = org.id === activeOrganization?.id;
+                      return (
+                        <button
+                          key={org.id}
+                          type="button"
+                          onClick={() => {
+                            void switchOrganization(org.id);
+                            setIsOrgDropdownOpen(false);
+                          }}
+                          className={`w-full flex items-center justify-between px-3 py-2 text-xs text-left transition-colors duration-150 cursor-pointer ${
+                            isSelected
+                              ? 'bg-slate-50 dark:bg-slate-800/80 text-slate-900 dark:text-slate-100 font-medium'
+                              : 'text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/50 hover:text-slate-900 dark:hover:text-slate-100'
+                          }`}
+                        >
+                          <span className="truncate">{org.name}</span>
+                          {isSelected && <Check size={13} className="text-blue-600 dark:text-blue-400 shrink-0 ml-2" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
-            )}
-          </div>
+            </>
+          )}
         </div>
 
         {/* Center: Primary Navigation */}
@@ -156,69 +185,69 @@ export const ProoflyGlobalHeader: React.FC = () => {
 
           <div className="h-4 w-px bg-slate-200 dark:bg-slate-800 mx-0.5 hidden sm:block" />
 
-          <div className="relative" ref={userMenuRef}>
-            <button
-              type="button"
-              onClick={() => setIsUserDropdownOpen(!isUserDropdownOpen)}
-              aria-expanded={isUserDropdownOpen}
-              className="flex items-center gap-2 px-2 py-1 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors duration-150 cursor-pointer"
-            >
-              <div className="w-6 h-6 rounded-full bg-slate-800 dark:bg-slate-700 text-white flex items-center justify-center font-medium text-[11px] ring-1 ring-slate-900/5 dark:ring-slate-600">
-                {initials}
-              </div>
-              <span className="hidden sm:inline text-xs font-medium text-slate-700 dark:text-slate-300">
-                {isJudgePersona ? 'Judge' : (currentUser?.displayName || 'Organizer')}
-              </span>
-              <ChevronDown
-                size={12}
-                className={`text-slate-400 dark:text-slate-500 transition-transform duration-150 ${
-                  isUserDropdownOpen ? 'rotate-180' : ''
-                }`}
-              />
-            </button>
+          {isAuthenticated && currentUser ? (
+            <div className="relative" ref={userMenuRef}>
+              <button
+                type="button"
+                onClick={() => setIsUserDropdownOpen(!isUserDropdownOpen)}
+                aria-expanded={isUserDropdownOpen}
+                className="flex items-center gap-2 px-2 py-1 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors duration-150 cursor-pointer"
+              >
+                <div className="w-6 h-6 rounded-full bg-slate-800 dark:bg-slate-700 text-white flex items-center justify-center font-medium text-[11px] ring-1 ring-slate-900/5 dark:ring-slate-600">
+                  {initials}
+                </div>
+                <span className="hidden sm:inline text-xs font-medium text-slate-700 dark:text-slate-300 max-w-[140px] truncate">
+                  {currentUser.displayName}
+                </span>
+                <ChevronDown
+                  size={12}
+                  className={`text-slate-400 dark:text-slate-500 transition-transform duration-150 ${
+                    isUserDropdownOpen ? 'rotate-180' : ''
+                  }`}
+                />
+              </button>
 
-            {isUserDropdownOpen && (
-              <div className="proofly-dropdown absolute right-0 mt-1.5 w-56 rounded-lg bg-white dark:bg-[#161F30] border border-slate-200 dark:border-slate-700/80 shadow-lg dark:shadow-black/40 py-1 z-50">
-                <div className="px-3 py-2 border-b border-slate-100 dark:border-slate-800">
-                  <p className="text-xs font-medium text-slate-900 dark:text-slate-100 truncate">
-                    {currentUser?.displayName}
-                  </p>
-                  <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
-                    {currentUser?.email}
-                  </p>
-                </div>
-                <div className="py-1">
-                  <div className="px-3 py-1 text-[11px] font-medium text-slate-400 dark:text-slate-500">
-                    Switch role
+              {isUserDropdownOpen && (
+                <div className="proofly-dropdown absolute right-0 mt-1.5 w-60 rounded-lg bg-white dark:bg-[#161F30] border border-slate-200 dark:border-slate-700/80 shadow-lg dark:shadow-black/40 py-1 z-50">
+                  <div className="px-3 py-2 border-b border-slate-100 dark:border-slate-800 space-y-0.5">
+                    <p className="text-xs font-medium text-slate-900 dark:text-slate-100 truncate">
+                      {currentUser.displayName}
+                    </p>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                      {currentUser.email}
+                    </p>
+                    {roleLabel && (
+                      <p className="text-[10px] font-medium uppercase tracking-wider text-blue-600 dark:text-blue-400 pt-0.5">
+                        {roleLabel}
+                      </p>
+                    )}
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      loginDemoUser('organizer');
-                      setIsUserDropdownOpen(false);
-                      navigate('/organizer');
-                    }}
-                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/70 transition-colors duration-150 cursor-pointer"
-                  >
-                    <span>Organizer</span>
-                    {!isJudgePersona && <Check size={13} className="text-blue-600 dark:text-blue-400" />}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      loginDemoUser('judge');
-                      setIsUserDropdownOpen(false);
-                      navigate('/judge/assignments');
-                    }}
-                    className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/70 transition-colors duration-150 cursor-pointer"
-                  >
-                    <span>Judge</span>
-                    {isJudgePersona && <Check size={13} className="text-blue-600 dark:text-blue-400" />}
-                  </button>
+                  <div className="py-1">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setIsUserDropdownOpen(false);
+                        await logout();
+                        navigate('/auth', { replace: true });
+                      }}
+                      className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-500/10 transition-colors duration-150 cursor-pointer"
+                    >
+                      <LogOut size={13} />
+                      <span>Sign out</span>
+                    </button>
+                  </div>
                 </div>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          ) : (
+            <Link
+              to="/auth"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-blue-600 hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-400 text-white text-xs font-medium transition-colors"
+            >
+              <LogIn size={13} />
+              <span>Sign in</span>
+            </Link>
+          )}
         </div>
       </div>
 

@@ -17,9 +17,12 @@ import { Modal } from '../../components/ui/Modal';
 import { Input } from '../../components/ui/Input';
 import { Card, CardHeader, CardTitle } from '../../components/ui/Card';
 import { useToast } from '../../components/ui/Toast';
+import { useProoflyAuth } from '../../context/ProoflyAuthContext';
 import { judgeAssignmentService } from '../../services/judgeAssignmentService';
 import { submissionService } from '../../services/submissionService';
 import { competitionService } from '../../services/competitionService';
+import { authorizationService } from '../../services/authorizationService';
+import { invitationService } from '../../services/invitationService';
 import type {
   JudgeRecord,
   JudgeAssignment,
@@ -29,6 +32,7 @@ import type { ProjectSubmission } from '../../types/submission';
 import type { Competition } from '../../types/authAndCompetition';
 
 export const OrganizerJudgesPage: React.FC = () => {
+  const { currentUser, verifiedSession, activeOrganization } = useProoflyAuth();
   const { success, warning, error: toastError } = useToast();
 
   const [judges, setJudges] = useState<JudgeRecord[]>([]);
@@ -114,19 +118,45 @@ export const OrganizerJudgesPage: React.FC = () => {
         .map((t) => t.trim())
         .filter(Boolean);
 
+      if (activeOrganization && judgeCompId) {
+        await authorizationService.assertAuthorized(verifiedSession, {
+          operation: 'JUDGE_INVITE_OR_ASSIGN',
+          organizationId: activeOrganization.id,
+          competitionId: judgeCompId,
+        });
+      } else if (activeOrganization) {
+        await authorizationService.assertAuthorized(verifiedSession, {
+          operation: 'ORG_MEMBER_MANAGE',
+          organizationId: activeOrganization.id,
+        });
+      }
+
       const newJudge = await judgeAssignmentService.inviteJudge({
+        organizationId: activeOrganization?.id,
         name: judgeName.trim(),
         email: judgeEmail.trim(),
         title: judgeTitle.trim() || 'Domain Specialist',
         organization: judgeOrg.trim() || 'External Evaluation Panel',
         assignedTracks: parsedTracks.length > 0 ? parsedTracks : ['General'],
-        competitionIds: judgeCompId ? [judgeCompId] : ['comp-default-ai'],
+        competitionIds: judgeCompId ? [judgeCompId] : [],
         maxQuota: Number(judgeQuota) || 8,
       });
 
+      let inviteHint = '';
+      if (verifiedSession && activeOrganization && judgeCompId) {
+        const invite = await invitationService.createInvitation(verifiedSession, {
+          targetType: 'COMPETITION',
+          organizationId: activeOrganization.id,
+          competitionId: judgeCompId,
+          email: judgeEmail.trim(),
+          role: 'JUDGE',
+        });
+        inviteHint = ` Invite URL: ${window.location.origin}/auth?invite=${invite.id}`;
+      }
+
       success(
         'Judge Invited Successfully',
-        `Access invitation and secure link dispatched to ${newJudge.email}.`
+        `Scoped JUDGE invitation created for ${newJudge.email}.${inviteHint}`
       );
       setInviteModalOpen(false);
       setJudgeName('');
@@ -136,6 +166,33 @@ export const OrganizerJudgesPage: React.FC = () => {
       await loadAllData();
     } catch (err: any) {
       toastError('Invitation Failed', err?.message || 'Could not invite judge.');
+    }
+  };
+
+  // Add current organizer as active judge
+  const handleAddMyselfAsJudge = async () => {
+    if (!currentUser) return;
+    try {
+      const targetCompId = selectedCompId === 'ALL' ? (competitions[0]?.id || '') : selectedCompId;
+      await judgeAssignmentService.inviteJudge({
+        id: currentUser.uid,
+        organizationId: activeOrganization?.id,
+        name: currentUser.displayName || 'Lead Organizer & Judge',
+        email: currentUser.email || '',
+        title: 'Competition Organizer & Lead Judge',
+        organization: activeOrganization?.name || 'Organizer Panel',
+        assignedTracks: ['General', 'All Tracks'],
+        competitionIds: targetCompId ? [targetCompId] : (competitions.map((c) => c.id)),
+        maxQuota: 25,
+      });
+
+      success(
+        'Added as Judge',
+        `You (${currentUser.displayName || currentUser.email}) are now registered as an active judge for this competition.`
+      );
+      await loadAllData();
+    } catch (err: any) {
+      toastError('Registration Failed', err?.message || 'Error adding yourself as judge.');
     }
   };
 
@@ -155,12 +212,21 @@ export const OrganizerJudgesPage: React.FC = () => {
     }
 
     try {
+      const targetCompId = selectedCompId === 'ALL' ? (competitions[0]?.id || '') : selectedCompId;
+      if (targetCompId) {
+        await authorizationService.assertAuthorized(verifiedSession, {
+          operation: 'JUDGE_INVITE_OR_ASSIGN',
+          organizationId: activeOrganization?.id,
+          competitionId: targetCompId,
+        });
+      }
+
       const assigned = await judgeAssignmentService.batchAssignSubmissions({
-        competitionId: selectedCompId === 'ALL' ? 'comp-default-ai' : selectedCompId,
+        competitionId: targetCompId,
         submissionIds: selectedSubmissionIds,
         judgeId: targetJudge.id,
-        assignedBy: 'user-organizer-01',
-        assignedByName: 'Saikeerthana (Lead Organizer)',
+        assignedBy: currentUser?.uid || '',
+        assignedByName: currentUser?.displayName || 'Organizer',
         deadline: assignDeadline ? new Date(assignDeadline).toISOString() : undefined,
       });
 
@@ -202,11 +268,17 @@ export const OrganizerJudgesPage: React.FC = () => {
     }
 
     try {
+      await authorizationService.assertAuthorized(verifiedSession, {
+        operation: 'JUDGE_INVITE_OR_ASSIGN',
+        organizationId: activeOrganization?.id,
+        competitionId: reassignTargetAsgn.competitionId,
+      });
+
       const updated = await judgeAssignmentService.reassignSubmission(
         reassignTargetAsgn.id,
         reassignNewJudgeId,
-        'user-organizer-01',
-        'Saikeerthana (Lead Organizer)',
+        currentUser?.uid || '',
+        currentUser?.displayName || 'Organizer',
         reassignReason
       );
 
@@ -251,6 +323,16 @@ export const OrganizerJudgesPage: React.FC = () => {
                 </option>
               ))}
             </select>
+            {currentUser && !judges.some((j) => j.id === currentUser.uid || j.email.toLowerCase() === currentUser.email?.toLowerCase()) && (
+              <Button
+                variant="outline"
+                size="xs"
+                leftIcon={<Plus size={13} />}
+                onClick={handleAddMyselfAsJudge}
+              >
+                Add myself as judge
+              </Button>
+            )}
             <Button
               variant="primary"
               size="xs"

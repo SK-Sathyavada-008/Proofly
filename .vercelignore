@@ -1,7 +1,0 @@
-node_modules
-.git
-.firebase
-.gemini
-coverage
-dist
-*.log

@@ -85,7 +85,7 @@ describe('Phase 9: Production Hardening, 13-Step E2E Functional & Reliability Ve
     expect(competition.rubric.reduce((s, c) => s + c.weight, 0)).toBe(100);
 
     // Activate competition
-    await competitionService.transitionStatus(competition.id, 'ACTIVE');
+    const activeCompetition = await competitionService.transitionStatus(competition.id, 'ACTIVE');
 
     // 4. Organizer creates/loads a submission form schema
     const formSchema = await formBuilderService.getFormSchema(competition.id);
@@ -145,7 +145,7 @@ describe('Phase 9: Production Hardening, 13-Step E2E Functional & Reliability Ve
           },
         ],
       },
-      competition
+      activeCompetition
     );
 
     expect(createdSub.referenceId).toMatch(/^PF-SUB-/);

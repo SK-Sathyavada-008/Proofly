@@ -22,13 +22,15 @@ export interface ActivationValidationResult {
  * Prevents illegal state jumps (e.g. DRAFT straight to PUBLISHED).
  */
 const VALID_TRANSITIONS: Record<CompetitionStatus, CompetitionStatus[]> = {
-  DRAFT: ['ACTIVE', 'ARCHIVED'],
-  ACTIVE: ['SUBMISSIONS_CLOSED', 'ARCHIVED'],
-  SUBMISSIONS_CLOSED: ['EVALUATION', 'ACTIVE', 'ARCHIVED'],
-  EVALUATION: ['RESULTS_REVIEW', 'SUBMISSIONS_CLOSED', 'ARCHIVED'],
-  RESULTS_REVIEW: ['PUBLISHED', 'EVALUATION', 'ARCHIVED'],
-  PUBLISHED: ['ARCHIVED'],
-  ARCHIVED: [], // Terminal state; must be cloned or explicitly unarchived
+  DRAFT: ['REGISTRATION_OPEN', 'ACTIVE', 'ARCHIVED'],
+  REGISTRATION_OPEN: ['REGISTRATION_CLOSED', 'ACTIVE', 'ARCHIVED'],
+  REGISTRATION_CLOSED: ['REGISTRATION_OPEN', 'ACTIVE', 'ARCHIVED'],
+  ACTIVE: ['SUBMISSIONS_CLOSED', 'EVALUATION', 'ARCHIVED'],
+  SUBMISSIONS_CLOSED: ['ACTIVE', 'EVALUATION', 'ARCHIVED'],
+  EVALUATION: ['SUBMISSIONS_CLOSED', 'RESULTS_REVIEW', 'ARCHIVED'],
+  RESULTS_REVIEW: ['EVALUATION', 'PUBLISHED', 'ARCHIVED'],
+  PUBLISHED: ['RESULTS_REVIEW', 'ARCHIVED'],
+  ARCHIVED: ['DRAFT'],
 };
 
 export const competitionLifecycleService = {
@@ -132,6 +134,30 @@ export const competitionLifecycleService = {
   },
 
   /**
+   * Checks whether participant registration is permitted for this competition.
+   */
+  canRegister(competition: Competition, now: Date = new Date()): { allowed: boolean; reason?: string } {
+    if (competition.status !== 'REGISTRATION_OPEN' && competition.status !== 'ACTIVE') {
+      return {
+        allowed: false,
+        reason: `Registration is not open. Competition status is "${competition.status}".`,
+      };
+    }
+
+    if (competition.policies.registrationDeadline) {
+      const regDeadline = new Date(competition.policies.registrationDeadline).getTime();
+      if (now.getTime() > regDeadline) {
+        return {
+          allowed: false,
+          reason: `Registration deadline passed on ${new Date(regDeadline).toISOString()}.`,
+        };
+      }
+    }
+
+    return { allowed: true };
+  },
+
+  /**
    * Checks whether submissions are currently accepted based on competition status and deadline.
    */
   canAcceptSubmissions(competition: Competition, now: Date = new Date()): { accepted: boolean; reason?: string } {
@@ -145,11 +171,23 @@ export const competitionLifecycleService = {
     const deadline = new Date(competition.policies.submissionDeadline).getTime();
     const currentTime = now.getTime();
 
-    if (currentTime > deadline && !competition.policies.allowLateSubmissions) {
-      return {
-        accepted: false,
-        reason: `Submission deadline passed on ${new Date(deadline).toISOString()}. Late submissions are not enabled.`,
-      };
+    if (currentTime > deadline) {
+      if (!competition.policies.allowLateSubmissions) {
+        return {
+          accepted: false,
+          reason: `Submissions are closed for this competition. Submission deadline passed on ${new Date(deadline).toISOString()}. Late submissions are not accepted.`,
+        };
+      }
+
+      if (competition.policies.lateSubmissionDeadline) {
+        const lateDeadline = new Date(competition.policies.lateSubmissionDeadline).getTime();
+        if (currentTime > lateDeadline) {
+          return {
+            accepted: false,
+            reason: `Late submission grace period expired on ${new Date(lateDeadline).toISOString()}. Late submissions are no longer accepted.`,
+          };
+        }
+      }
     }
 
     return { accepted: true };

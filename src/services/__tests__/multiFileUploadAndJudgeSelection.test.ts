@@ -4,7 +4,8 @@
 // ─────────────────────────────────────────────
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { fileStorageService } from '../fileStorageService';
+import { fileStorageService, StorageUploadError } from '../fileStorageService';
+import { sha256Bytes } from '../../utils/cryptoUtils';
 import { submissionService } from '../submissionService';
 import { competitionService } from '../competitionService';
 import { evaluationPipelineService } from '../evaluationPipelineService';
@@ -17,8 +18,8 @@ describe('Multi-File Upload & Judge Competition Queue Switching', () => {
     submissionService.resetInMemoryStore(SEED_SUBMISSIONS);
   });
 
-  describe('1. Batch Multi-File Upload & Magic-Byte Validation', () => {
-    it('successfully uploads multiple diverse files (PDF, ZIP, PPTX, JSON, PNG) in batch', async () => {
+  describe('1. Batch Multi-File Validation, Canonical Paths & No Mock Upload Success', () => {
+    it('validates multiple diverse official formats (PDF, ZIP, PNG, JSON), computes distinct full-file SHA-256 hashes, and refuses mock upload when Storage is unavailable', async () => {
       // 1. PDF bytes (%PDF-)
       const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x35]);
       // 2. ZIP bytes (PK\x03\x04)
@@ -35,84 +36,67 @@ describe('Multi-File Upload & Judge Competition Queue Switching', () => {
         { name: 'config.json', size: jsonBytes.length, bytes: jsonBytes },
       ];
 
-      const allowedExtensions = [
-        '.pdf', '.ppt', '.pptx', '.doc', '.docx', '.zip', '.tar', '.gz',
-        '.png', '.jpg', '.jpeg', '.gif', '.webp', '.txt', '.md', '.csv', '.json',
-      ];
+      const allowedExtensions = ['.pdf', '.ppt', '.pptx', '.zip', '.png', '.jpg', '.jpeg', '.webp', '.txt', '.md', '.json'];
 
-      const uploadedResults = [];
-      const errors: string[] = [];
-
+      const hashes = new Set<string>();
       for (let i = 0; i < filesToUpload.length; i++) {
         const item = filesToUpload[i];
-        try {
-          const validation = await fileStorageService.validateFile(item, {
-            allowedExtensions,
-            maxSizeMb: 50,
-          });
-          expect(validation.valid).toBe(true);
+        const validation = await fileStorageService.validateFile(item, {
+          allowedExtensions,
+          maxSizeMb: 25,
+          strictStorageFormats: true,
+        });
+        expect(validation.valid).toBe(true);
 
-          const metadata = await fileStorageService.uploadFile(item as any, {
+        const hash = await sha256Bytes(item.bytes);
+        expect(hash).toHaveLength(64);
+        hashes.add(hash);
+
+        const canonicalPath = fileStorageService.buildCanonicalStoragePath({
+          organizationId: 'org-krivee',
+          competitionId: 'comp-krivee',
+          submissionId: `sub_krivee_${i}`,
+          fileId: `file_${i}`,
+          sanitizedFileName: fileStorageService.sanitizeFileName(item.name),
+        });
+        expect(canonicalPath).toBe(
+          `organizations/org-krivee/competitions/comp-krivee/submissions/sub_krivee_${i}/file_${i}_${item.name}`
+        );
+
+        // Without live Firebase Storage / Emulator, uploadFile MUST fail cleanly (no mock success!)
+        await expect(
+          fileStorageService.uploadFile(item as any, {
             fieldId: 'artifact_files',
+            organizationId: 'org-krivee',
             competitionId: 'comp-krivee',
-            submissionId: `sub_krivee_${Date.now()}_${i}`,
+            submissionId: `sub_krivee_${i}`,
+            uploaderUid: 'uid-participant-1',
             allowedExtensions,
-            maxSizeMb: 50,
-          });
-          uploadedResults.push(metadata);
-        } catch (err: any) {
-          errors.push(err.message);
-        }
+            maxSizeMb: 25,
+          })
+        ).rejects.toThrow(StorageUploadError);
       }
 
-      expect(errors).toHaveLength(0);
-      expect(uploadedResults).toHaveLength(4);
-      expect(uploadedResults[0].fileName).toBe('architecture_diagram.png');
-      expect(uploadedResults[1].fileName).toBe('pitch_deck.pdf');
-      expect(uploadedResults[2].fileName).toBe('source_code.zip');
-      expect(uploadedResults[3].fileName).toBe('config.json');
-
-      // Verify each has distinct sha256 checksum and download URL
-      const hashes = new Set(uploadedResults.map((u) => u.checksum));
       expect(hashes.size).toBe(4);
     });
 
-    it('isolates invalid files during multi-file upload so valid files still succeed', async () => {
+    it('rejects malicious executables and unsupported formats cleanly during validation', async () => {
       const pdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x35]);
       // Windows executable bytes (MZ)
       const exeBytes = new Uint8Array([0x4d, 0x5a, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00]);
 
-      const files = [
+      const validPdf = await fileStorageService.validateFile(
         { name: 'valid_report.pdf', size: pdfBytes.length, bytes: pdfBytes },
+        { allowedExtensions: ['.pdf', '.zip'], maxSizeMb: 25, strictStorageFormats: true }
+      );
+      expect(validPdf.valid).toBe(true);
+
+      const badExe = await fileStorageService.validateFile(
         { name: 'malicious_tool.exe', size: exeBytes.length, bytes: exeBytes },
-      ];
-
-      const successfulFiles = [];
-      const caughtErrors: string[] = [];
-
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        try {
-          const metadata = await fileStorageService.uploadFile(file as any, {
-            fieldId: 'artifact_files',
-            competitionId: 'comp-krivee',
-            submissionId: `sub_test_${i}`,
-            allowedExtensions: ['.pdf', '.zip'],
-            maxSizeMb: 25,
-          });
-          successfulFiles.push(metadata);
-        } catch (err: any) {
-          caughtErrors.push(`${file.name}: ${err.message}`);
-        }
-      }
-
-      // Valid PDF succeeded
-      expect(successfulFiles).toHaveLength(1);
-      expect(successfulFiles[0].fileName).toBe('valid_report.pdf');
-
-      // Malicious file was caught and rejected
-      expect(caughtErrors).toHaveLength(1);
-      expect(caughtErrors[0]).toContain('Executable file extensions are strictly prohibited');
+        { allowedExtensions: ['.pdf', '.zip'], maxSizeMb: 25, strictStorageFormats: true }
+      );
+      expect(badExe.valid).toBe(false);
+      expect(badExe.error).toContain('Executable file extensions are strictly prohibited');
     });
   });
 

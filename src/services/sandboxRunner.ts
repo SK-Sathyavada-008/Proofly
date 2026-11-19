@@ -1,6 +1,7 @@
 // ─────────────────────────────────────────────
-// PRison Break — Untrusted Java Code Sandbox Runner
-// Isolated Execution · Resource Limits · Test Tampering Protection
+// sandboxRunner.ts — Legacy / Test Harness Only Sandbox Runner
+// Proofly Architecture: Arbitrary Untrusted Code Execution is UNSUPPORTED in Production
+// Retained capabilities: Test tampering detection & environment sanitization algorithms
 // ─────────────────────────────────────────────
 
 export interface SandboxExecutionConfig {
@@ -68,15 +69,18 @@ export interface SandboxTestResult {
   executionTimeMs: number;
   log: string;
   error?: string;
+  isSimulated?: boolean;
+  executionMode?: 'CONTAINER' | 'SIMULATED' | 'UNSUPPORTED';
 }
 
 // Global flag to configure sandbox environment availability
-let sandboxEnvironmentConfigured = true;
+// Defaults to FALSE in production: Proofly does not provide an in-process isolated container runtime.
+let sandboxEnvironmentConfigured = false;
 
 export const sandboxRunner = {
   /**
    * Configures whether the automated execution sandbox is available in this environment.
-   * If false, submissions will be reported as SANDBOX_UNAVAILABLE and sent to manual review.
+   * Defaults to false. If false, submissions will be reported as SANDBOX_UNAVAILABLE and sent to manual review.
    */
   setSandboxAvailable(available: boolean) {
     sandboxEnvironmentConfigured = available;
@@ -175,6 +179,11 @@ export const sandboxRunner = {
    * Executes builds and tests inside an isolated sandbox with limits.
    * If the sandbox is unavailable, it reports that automated execution is unavailable
    * and requests manual review without pretending the code passed.
+   *
+   * PRODUCTION INVARIANT: Untrusted arbitrary code execution is strictly UNSUPPORTED
+   * in production without a dedicated microVM or container daemon.
+   * Simulated test fixtures are strictly labeled as simulated and never misrepresented
+   * as real sandbox execution.
    */
   async executeJavaTests(input: SandboxExecutionInput): Promise<SandboxTestResult> {
     const startTime = Date.now();
@@ -192,8 +201,10 @@ export const sandboxRunner = {
         edgeCasesPassed: false,
         tamperingDetected: false,
         executionTimeMs: Date.now() - startTime,
-        log: 'Execution aborted: Safe isolated runner sandbox is unavailable.',
-        error: 'Automated execution sandbox unavailable — contribution sent to manual review.',
+        executionMode: 'UNSUPPORTED',
+        isSimulated: false,
+        log: 'Execution aborted: Arbitrary untrusted code execution is strictly unsupported without a production-grade isolated container daemon (e.g. gVisor, Firecracker).',
+        error: 'Automated execution sandbox unavailable — arbitrary untrusted code execution is disabled without an isolated container daemon.',
       };
     }
 
@@ -212,6 +223,8 @@ export const sandboxRunner = {
         tamperingDetected: true,
         tamperingDetails: tampering.reasons,
         executionTimeMs: Date.now() - startTime,
+        executionMode: 'UNSUPPORTED',
+        isSimulated: false,
         log: `SECURITY VIOLATION: Test tampering detected. ${tampering.reasons.join('; ')}`,
         error: `PR modified, disabled, or removed tests to pass validation: ${tampering.tamperedFiles.join(', ')}`,
       };
@@ -232,7 +245,9 @@ export const sandboxRunner = {
         edgeCasesPassed: false,
         tamperingDetected: false,
         executionTimeMs: Date.now() - startTime,
-        log: 'JVM terminated unexpectedly with non-zero exit code.',
+        executionMode: 'SIMULATED',
+        isSimulated: true,
+        log: 'JVM process crash simulated via test harness fixture.',
         error: 'Sandbox process crashed or exceeded memory limit (256MB).',
       };
     }
@@ -249,7 +264,9 @@ export const sandboxRunner = {
         edgeCasesPassed: false,
         tamperingDetected: false,
         executionTimeMs: DEFAULT_SANDBOX_CONFIG.timeoutMs,
-        log: `Execution timed out after ${DEFAULT_SANDBOX_CONFIG.timeoutMs}ms.`,
+        executionMode: 'SIMULATED',
+        isSimulated: true,
+        log: `Execution timed out after ${DEFAULT_SANDBOX_CONFIG.timeoutMs}ms (simulated test harness).`,
         error: 'Execution exceeded 10000ms limit. Potential infinite loop or blocking I/O.',
       };
     }
@@ -268,7 +285,9 @@ export const sandboxRunner = {
         edgeCasesPassed: false,
         tamperingDetected: false,
         executionTimeMs: 120,
-        log: 'COMPILATION ERROR: Source files could not compile against Java 17.',
+        executionMode: 'SIMULATED',
+        isSimulated: true,
+        log: 'COMPILATION ERROR: Source files could not compile against Java 17 (simulated test harness).',
         error: 'Compilation failed.',
       };
     }
@@ -290,7 +309,9 @@ export const sandboxRunner = {
       edgeCasesPassed,
       tamperingDetected: false,
       executionTimeMs: 450,
-      log: `Compilation: OK. Tests run: ${totalTests}, Failures: ${testsFailed}, Errors: 0, Skipped: 0.`,
+      executionMode: 'SIMULATED',
+      isSimulated: true,
+      log: `SIMULATED TEST FIXTURE: Tests run: ${totalTests}, Failures: ${testsFailed}, Errors: 0, Skipped: 0. (Simulated execution via test harness fixture; arbitrary untrusted code execution is unsupported in production).`,
     };
   },
 };

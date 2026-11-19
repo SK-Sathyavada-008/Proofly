@@ -176,26 +176,30 @@ describe('Track & Theme Relevance Verification and Differentiated AI Evaluation'
     expect(sessionRes.valid).toBe(true);
     const sessionToken = sessionRes.session!.sessionToken;
 
+    const activeComp = (await competitionService.getCompetition(comp.id)) || comp;
+
     // 2. Participant submits project specifying Event Tech track
     const subPayload = {
       competitionId: comp.id,
       sessionToken,
       submissionType: 'INDIVIDUAL' as const,
       primaryContactName: 'Saikeerthana Sathyavada',
+      primaryContactEmail: 'saikeerthana@example.com',
       projectTitle: 'EventScout',
       projectDescription: 'Personal AI opportunity scout that continuously discovers events from fragmented sources and ranks them for attendees.',
+      githubUrl: 'https://github.com/sk-sathyavada-008/eventscout',
       track: 'Event Tech & Community Discovery',
       fieldValues: {
         track: 'Event Tech & Community Discovery',
       },
     };
 
-    const subResult = await submissionService.createSubmission(subPayload, comp);
+    const subResult = await submissionService.createSubmission(subPayload, activeComp);
     expect(subResult.submission.track).toBe('Event Tech & Community Discovery');
     expect(subResult.submission.fieldValues.track).toBe('Event Tech & Community Discovery');
 
     // 3. Run execution pipeline
-    const pipelineResult = await evaluationPipelineService.executePipeline(subResult.submission, comp);
+    const pipelineResult = await evaluationPipelineService.executePipeline(subResult.submission, activeComp);
     expect(pipelineResult.success).toBe(true);
     expect(pipelineResult.report).toBeDefined();
     expect(pipelineResult.report?.trackRelevance?.selectedTrack).toBe('Event Tech & Community Discovery');

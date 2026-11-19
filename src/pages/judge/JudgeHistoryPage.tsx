@@ -24,7 +24,7 @@ interface HistoryRow {
 
 export const JudgeHistoryPage: React.FC = () => {
   const { currentUser } = useProoflyAuth();
-  const judgeId = currentUser?.uid || 'user-judge-demo';
+  const judgeId = currentUser?.uid || '';
 
   const [historyRows, setHistoryRows] = useState<HistoryRow[]>([]);
   const [loading, setLoading] = useState(true);

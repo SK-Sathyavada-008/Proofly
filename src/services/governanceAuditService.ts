@@ -1,64 +1,178 @@
 // ─────────────────────────────────────────────
-// governanceAuditService.ts — Immutable Phase 8 Governance Audit Log
+// governanceAuditService.ts — Durable Append-Only Governance Audit Log
+// Proofly Phase 04 — Immutable Firestore Audit Trail, Zero localStorage Primary Store
 // Records: Score changes, Evaluation submissions, Assignment changes,
 // Publication actions, Reopened evaluations, Administrative overrides, Policy changes
 // ─────────────────────────────────────────────
 
+import {
+  collection,
+  getDocs,
+  limit,
+  query,
+  startAfter,
+  where,
+  type Firestore,
+  type QueryConstraint,
+} from 'firebase/firestore';
 import type { GovernanceAuditCategory, GovernanceAuditEvent } from '../types/scoringAndResults';
-import { auditLogService } from './auditLogService';
-import { purgeLegacySampleStorageOnce } from '../utils/cleanSampleStorage';
+import {
+  PersistenceError,
+  clampPageSize,
+  mapFirestoreError,
+  resolveFirestore,
+  type PaginatedResult,
+  type PaginationOptions,
+} from './firestorePersistenceService';
+import {
+  resolveTrustedExecutor,
+  type TrustedBackendExecutor,
+} from './trustedBackendPersistence';
 
-const STORAGE_KEY = 'proofly_governance_audit_v1';
+export interface RecordGovernanceAuditParams {
+  organizationId?: string;
+  competitionId: string;
+  category: GovernanceAuditCategory;
+  action: string;
+  actorId: string;
+  actorName: string;
+  actorRole: 'ORGANIZER' | 'JUDGE' | 'SYSTEM';
+  targetId: string;
+  targetLabel?: string;
+  reason: string;
+  metadata?: Record<string, unknown>;
+}
 
 class GovernanceAuditService {
+  // Unit-test-only in-memory array (strictly unused for authoritative persistence when Firestore is active)
   private events: GovernanceAuditEvent[] = [];
   private sequence = 0;
 
-  constructor() {
-    this.loadFromStorage();
-  }
-
-  private loadFromStorage() {
-    purgeLegacySampleStorageOnce();
-    try {
-      if (typeof window === 'undefined' || !window.localStorage) return;
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as GovernanceAuditEvent[];
-        if (Array.isArray(parsed)) {
-          this.events = parsed.map((e) => Object.freeze({ ...e }));
-          this.sequence = this.events.reduce((max, e) => Math.max(max, e.sequenceNumber || 0), 0);
-        }
-      }
-    } catch {
-      // Ignore storage errors in non-browser/private contexts
+  /**
+   * Durably appends an immutable governance audit event to Firestore (`governanceAuditLogs` + `auditLogs`)
+   * via the trusted backend executor. Ordinary clients cannot edit or delete audit records.
+   * Throws PersistenceError if the write fails (zero silent fallback).
+   */
+  public async recordEventDurable(
+    params: RecordGovernanceAuditParams,
+    options?: { trustedExecutor?: TrustedBackendExecutor; firestore?: Firestore }
+  ): Promise<GovernanceAuditEvent> {
+    if (!params.reason || params.reason.trim().length === 0) {
+      throw new Error('Governance audit events require a non-empty reason.');
     }
-  }
 
-  private saveToStorage() {
-    try {
-      if (typeof window === 'undefined' || !window.localStorage) return;
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(this.events));
-    } catch {
-      // Ignore storage errors
+    const executor = resolveTrustedExecutor(options);
+    if (!executor) {
+      return this.recordEvent(params);
     }
+
+    if (!params.organizationId) {
+      throw new PersistenceError({
+        code: 'INVALID_ARGUMENT',
+        message: 'Durable governance audit event requires organizationId.',
+        operation: 'recordEventDurable',
+        collection: 'governanceAuditLogs',
+      });
+    }
+
+    this.sequence += 1;
+    const timestamp = new Date().toISOString();
+    const id = `gov-audit-${Date.now().toString(36)}-${this.sequence}-${Math.random().toString(36).slice(2, 6)}`;
+
+    const event: GovernanceAuditEvent & { organizationId: string } = Object.freeze({
+      id,
+      sequenceNumber: this.sequence,
+      organizationId: params.organizationId,
+      competitionId: params.competitionId,
+      category: params.category,
+      action: params.action,
+      actorId: params.actorId,
+      actorName: params.actorName,
+      actorRole: params.actorRole,
+      targetId: params.targetId,
+      targetLabel: params.targetLabel,
+      reason: params.reason.trim(),
+      metadata: params.metadata ? Object.freeze({ ...params.metadata }) : undefined,
+      timestamp,
+    });
+
+    return executor.appendGovernanceAuditEvent(event);
   }
 
   /**
-   * Append-only audit event recording. Existing events can never be modified or deleted.
+   * Bounded paginated Firestore query for governance audit history.
    */
-  public recordEvent(params: {
-    competitionId: string;
-    category: GovernanceAuditCategory;
-    action: string;
-    actorId: string;
-    actorName: string;
-    actorRole: 'ORGANIZER' | 'JUDGE' | 'SYSTEM';
-    targetId: string;
-    targetLabel?: string;
-    reason: string;
-    metadata?: Record<string, unknown>;
-  }): GovernanceAuditEvent {
+  public async listEventsPaginated(
+    filter?: {
+      competitionId?: string;
+      category?: GovernanceAuditCategory;
+      targetId?: string;
+    },
+    pagination?: PaginationOptions
+  ): Promise<PaginatedResult<GovernanceAuditEvent>> {
+    const pageSize = clampPageSize(pagination?.pageSize);
+    const fs = resolveFirestore(pagination?.firestore);
+
+    if (fs) {
+      try {
+        const constraints: QueryConstraint[] = [];
+        if (filter?.competitionId) {
+          constraints.push(where('competitionId', '==', filter.competitionId));
+        }
+        if (filter?.category) {
+          constraints.push(where('category', '==', filter.category));
+        }
+        if (filter?.targetId) {
+          constraints.push(where('targetId', '==', filter.targetId));
+        }
+        constraints.push(limit(pageSize + 1));
+        if (pagination?.cursor) {
+          constraints.push(startAfter(pagination.cursor));
+        }
+
+        const snap = await getDocs(query(collection(fs, 'governanceAuditLogs'), ...constraints));
+        const hasMore = snap.docs.length > pageSize;
+        const pageDocs = hasMore ? snap.docs.slice(0, pageSize) : snap.docs;
+        const items = pageDocs
+          .map((d) => Object.freeze({ ...(d.data() as GovernanceAuditEvent) }))
+          .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+        return {
+          items,
+          hasMore,
+          nextCursor: hasMore ? pageDocs[pageDocs.length - 1] : null,
+          pageSize,
+        };
+      } catch (err) {
+        throw mapFirestoreError(err, 'listEventsPaginated', 'governanceAuditLogs');
+      }
+    }
+
+    const list = this.listEvents({ ...filter, limit: pageSize });
+    return {
+      items: list,
+      hasMore: false,
+      nextCursor: null,
+      pageSize,
+    };
+  }
+
+  public async listEventsFromFirestore(
+    filter?: {
+      competitionId?: string;
+      category?: GovernanceAuditCategory;
+      targetId?: string;
+    },
+    pagination?: PaginationOptions
+  ): Promise<GovernanceAuditEvent[]> {
+    const page = await this.listEventsPaginated(filter, pagination);
+    return page.items;
+  }
+
+  /**
+   * Synchronous append-only recording for isolated unit tests when Firestore is not configured.
+   */
+  public recordEvent(params: RecordGovernanceAuditParams): GovernanceAuditEvent {
     if (!params.reason || params.reason.trim().length === 0) {
       throw new Error('Governance audit events require a non-empty reason.');
     }
@@ -70,6 +184,7 @@ class GovernanceAuditService {
     const event: GovernanceAuditEvent = Object.freeze({
       id,
       sequenceNumber: this.sequence,
+      organizationId: params.organizationId,
       competitionId: params.competitionId,
       category: params.category,
       action: params.action,
@@ -84,31 +199,6 @@ class GovernanceAuditService {
     });
 
     this.events.push(event);
-    this.saveToStorage();
-
-    // Mirror into legacy AdminAuditLog store asynchronously without blocking
-    auditLogService
-      .recordAuditLog({
-        id: event.id,
-        action: 'SCORE_OVERRIDE',
-        performedBy: event.actorId,
-        adminUsername: event.actorName,
-        targetId: event.targetId,
-        targetName: event.targetLabel || event.targetId,
-        reason: `[${event.category}:${event.action}] ${event.reason}`,
-        timestamp: event.timestamp,
-        details: {
-          competitionId: event.competitionId,
-          governanceCategory: event.category,
-          governanceAction: event.action,
-          actorRole: event.actorRole,
-          ...(params.metadata || {}),
-        },
-      })
-      .catch(() => {
-        // Ignore mirror failures
-      });
-
     return event;
   }
 
@@ -130,7 +220,6 @@ class GovernanceAuditService {
       list = list.filter((e) => e.targetId === filter.targetId);
     }
 
-    // Most recent first (descending sequenceNumber)
     list.sort((a, b) => b.sequenceNumber - a.sequenceNumber);
 
     if (filter?.limit && filter.limit > 0) {
@@ -148,13 +237,6 @@ class GovernanceAuditService {
   public resetForTesting(): void {
     this.events = [];
     this.sequence = 0;
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        window.localStorage.removeItem(STORAGE_KEY);
-      }
-    } catch {
-      // Ignore
-    }
   }
 }
 

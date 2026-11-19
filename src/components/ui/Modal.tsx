@@ -1,4 +1,5 @@
 import React, { useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 
 export interface ModalProps {
@@ -47,11 +48,11 @@ export const Modal: React.FC<ModalProps> = ({
     '3xl': 'max-w-3xl',
   };
 
-  return (
+  const modalContent = (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 overflow-y-auto">
       {/* Backdrop */}
       <div
-        className="proofly-modal-backdrop fixed inset-0 bg-slate-900/45 dark:bg-black/70 backdrop-blur-xs"
+        className="proofly-modal-backdrop fixed inset-0 bg-slate-900/60 dark:bg-black/80 backdrop-blur-xs"
         onClick={onClose}
       />
 
@@ -59,7 +60,7 @@ export const Modal: React.FC<ModalProps> = ({
       <div
         role="dialog"
         aria-modal="true"
-        className={`proofly-modal-panel relative w-full ${maxWidthStyles[maxWidth]} bg-white dark:bg-[#161F30] rounded-xl shadow-xl dark:shadow-black/50 border border-slate-200 dark:border-slate-700/80 z-10 overflow-hidden my-8`}
+        className={`proofly-modal-panel relative w-full ${maxWidthStyles[maxWidth]} bg-white dark:bg-[#161F30] rounded-xl shadow-2xl dark:shadow-black/70 border border-slate-200 dark:border-slate-700/80 z-10 overflow-hidden my-auto`}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -98,4 +99,8 @@ export const Modal: React.FC<ModalProps> = ({
       </div>
     </div>
   );
+
+  return typeof document !== 'undefined'
+    ? createPortal(modalContent, document.body)
+    : modalContent;
 };

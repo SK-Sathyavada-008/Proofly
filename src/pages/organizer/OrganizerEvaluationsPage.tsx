@@ -71,7 +71,7 @@ export const OrganizerEvaluationsPage: React.FC = () => {
       // Ensure any final submission in 'Queued for AI Evaluation' has a job
       for (const sub of allSubs) {
         if (sub.status === 'Queued for AI Evaluation' || sub.status === 'AI Evaluation In Progress') {
-          await evaluationQueueService.enqueueSubmission(sub.id, sub.competitionId, sub.referenceId);
+          await evaluationQueueService.enqueueSubmission(sub.id, sub.competitionId, sub.referenceId, sub.organizationId);
         }
       }
 
@@ -202,8 +202,10 @@ export const OrganizerEvaluationsPage: React.FC = () => {
   };
 
   // Metrics
-  const queuedCount = jobs.filter((j) => j.status === 'QUEUED').length;
-  const inProgressCount = jobs.filter((j) => j.status === 'IN_PROGRESS' || j.status === 'LEASED').length;
+  const queuedCount = jobs.filter((j) => j.status === 'QUEUED' || j.status === 'RETRY_WAIT').length;
+  const inProgressCount = jobs.filter((j) =>
+    ['IN_PROGRESS', 'LEASED', 'CLAIMED', 'EXTRACTING', 'EVALUATING', 'VALIDATING'].includes(j.status)
+  ).length;
   const completedCount = jobs.filter((j) => j.status === 'COMPLETED').length;
   const failedCount = jobs.filter((j) => j.status === 'FAILED').length;
 
@@ -357,18 +359,43 @@ export const OrganizerEvaluationsPage: React.FC = () => {
 
                   <TableCell className="text-right">
                     <div className="flex items-center justify-end gap-1.5">
-                      {sub.status === 'AI Evaluation Failed' && (
-                        <Button
-                          variant="outline"
-                          size="xs"
-                          onClick={() => {
-                            setOverrideJob(job || null);
-                            setIsOverrideModalOpen(true);
-                          }}
-                          className="text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/30 hover:bg-rose-50 dark:hover:bg-rose-500/15"
-                        >
-                          Override Failure
-                        </Button>
+                      {((job && job.status === 'FAILED') || sub.status === 'AI Evaluation Failed') && (
+                        <>
+                          <Button
+                            variant="outline"
+                            size="xs"
+                            onClick={async () => {
+                              if (job) {
+                                try {
+                                  await evaluationQueueService.retryJobManual({
+                                    jobId: job.id,
+                                    organizerUserId: workerId,
+                                    organizerName: 'Competition Organizer',
+                                    auditReason: 'Organizer manual queue retry from evaluation dashboard',
+                                  });
+                                  await loadData();
+                                  success('Job Re-queued', `Evaluation job for ${job.referenceId} has been reset to QUEUED.`);
+                                } catch (err: any) {
+                                  error('Retry Failed', err?.message || 'Could not reset job.');
+                                }
+                              }
+                            }}
+                            className="text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/30 hover:bg-amber-50 dark:hover:bg-amber-500/15"
+                          >
+                            Retry Job
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="xs"
+                            onClick={() => {
+                              setOverrideJob(job || null);
+                              setIsOverrideModalOpen(true);
+                            }}
+                            className="text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/30 hover:bg-rose-50 dark:hover:bg-rose-500/15"
+                          >
+                            Override Failure
+                          </Button>
+                        </>
                       )}
 
                       {sub.status === 'Queued for AI Evaluation' && (

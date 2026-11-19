@@ -167,4 +167,129 @@ export const scopedAuthService = {
 
     return { allowed: true, resolvedRole: orgRole };
   },
+
+  /**
+   * Checks whether the user can view a competition's non-public workspace resources.
+   * Allows Platform Admin, any Organization member (OWNER/ADMIN/MEMBER), or any
+   * Competition role (COMPETITION_ADMIN, ORGANIZER, JUDGE, VIEWER).
+   */
+  canViewCompetition(
+    context: UserAuthContext,
+    competitionId: string,
+    orgId: string
+  ): PermissionCheckResult {
+    const compRole = this.resolveCompetitionRole(context, competitionId, orgId);
+    if (compRole) {
+      return { allowed: true, resolvedRole: compRole };
+    }
+    const orgRole = this.resolveOrgRole(context, orgId);
+    if (orgRole) {
+      return { allowed: true, resolvedRole: orgRole };
+    }
+    return {
+      allowed: false,
+      reason: `Access denied: User "${context.email}" has no authorized role for competition "${competitionId}".`,
+    };
+  },
+
+  /**
+   * Checks whether the user can mutate forms, access keys, or judge assignments.
+   * Strictly denies VIEWER, JUDGE, and basic org MEMBER roles.
+   */
+  canManageCompetitionResources(
+    context: UserAuthContext,
+    competitionId: string,
+    orgId: string
+  ): PermissionCheckResult {
+    const role = this.resolveCompetitionRole(context, competitionId, orgId);
+    if (role === 'COMPETITION_ADMIN' || role === 'ORGANIZER') {
+      return { allowed: true, resolvedRole: role };
+    }
+    if (role === 'VIEWER') {
+      return {
+        allowed: false,
+        reason: 'Viewer role is strictly read-only and cannot modify competition resources.',
+        resolvedRole: role,
+      };
+    }
+    if (role === 'JUDGE') {
+      return {
+        allowed: false,
+        reason: 'Judge role cannot perform organizer-only mutations.',
+        resolvedRole: role,
+      };
+    }
+    return {
+      allowed: false,
+      reason: 'Managing competition resources requires COMPETITION_ADMIN, ORGANIZER, or Org OWNER/ADMIN privileges.',
+      resolvedRole: role || undefined,
+    };
+  },
+
+  /**
+   * Checks whether the user is allowed to enter the Organizer Console workspace.
+   * Pure JUDGE-only users are explicitly excluded from organizer console routes.
+   */
+  canAccessOrganizerWorkspace(context: UserAuthContext): boolean {
+    if (context.platformRole === 'SUPER_ADMIN') {
+      return true;
+    }
+    const hasOrgManagementOrMembership = Object.values(context.orgMemberships).some(
+      (role) => role === 'OWNER' || role === 'ADMIN' || role === 'MEMBER'
+    );
+    if (hasOrgManagementOrMembership) {
+      return true;
+    }
+    const hasOrganizerOrViewerCompRole = Object.values(context.competitionRoles).some(
+      (role) => role === 'COMPETITION_ADMIN' || role === 'ORGANIZER' || role === 'VIEWER'
+    );
+    return hasOrganizerOrViewerCompRole;
+  },
+
+  /**
+   * Checks whether the user is allowed to enter the Judge Workspace.
+   * VIEWER-only and unaffiliated users are excluded.
+   */
+  canAccessJudgeWorkspace(context: UserAuthContext): boolean {
+    if (context.platformRole === 'SUPER_ADMIN') {
+      return true;
+    }
+    const hasJudgingCompRole = Object.values(context.competitionRoles).some(
+      (role) => role === 'JUDGE' || role === 'ORGANIZER' || role === 'COMPETITION_ADMIN'
+    );
+    if (hasJudgingCompRole) {
+      return true;
+    }
+    return Object.values(context.orgMemberships).some(
+      (role) => role === 'OWNER' || role === 'ADMIN'
+    );
+  },
+
+  /**
+   * Checks whether the user holds strictly read-only (VIEWER / MEMBER) access
+   * within the given org + optional competition scope.
+   */
+  isReadOnlyViewer(
+    context: UserAuthContext,
+    orgId?: string,
+    competitionId?: string
+  ): boolean {
+    if (context.platformRole === 'SUPER_ADMIN') return false;
+    if (orgId) {
+      const orgRole = this.resolveOrgRole(context, orgId);
+      if (orgRole === 'OWNER' || orgRole === 'ADMIN') return false;
+    }
+    if (competitionId && orgId) {
+      const compRole = this.resolveCompetitionRole(context, competitionId, orgId);
+      if (compRole === 'COMPETITION_ADMIN' || compRole === 'ORGANIZER' || compRole === 'JUDGE') {
+        return false;
+      }
+      return compRole === 'VIEWER' || this.resolveOrgRole(context, orgId) === 'MEMBER';
+    }
+    if (orgId) {
+      return this.resolveOrgRole(context, orgId) === 'MEMBER';
+    }
+    const compRoles = Object.values(context.competitionRoles);
+    return compRoles.length > 0 && compRoles.every((r) => r === 'VIEWER');
+  },
 };

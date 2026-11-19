@@ -22,11 +22,14 @@ import { Textarea } from '../../components/ui/Textarea';
 import { useToast } from '../../components/ui/Toast';
 import { submissionService } from '../../services/submissionService';
 import { competitionService } from '../../services/competitionService';
+import { fileStorageService } from '../../services/fileStorageService';
+import { useProoflyAuth } from '../../context/ProoflyAuthContext';
 import { ALL_SUBMISSION_STATUSES, type ProjectSubmission } from '../../types/submission';
 import type { Competition } from '../../types/authAndCompetition';
 
 export const ParticipantSubmissionManagePage: React.FC = () => {
   const [searchParams] = useSearchParams();
+  const { currentUser, verifiedSession } = useProoflyAuth();
   const { success, error: toastError } = useToast();
 
   const refParam = searchParams.get('ref') || '';
@@ -471,29 +474,49 @@ export const ParticipantSubmissionManagePage: React.FC = () => {
               <p className="text-xs text-slate-400 dark:text-slate-500">No binary files uploaded.</p>
             ) : (
               <div className="space-y-2">
-                {submission.files.map((f) => (
-                  <div
-                    key={f.id}
-                    className="p-2.5 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-200 dark:border-slate-700/80 text-xs flex items-center justify-between gap-2"
-                  >
-                    <div className="truncate">
-                      <span className="font-semibold text-slate-800 dark:text-slate-200 block truncate">{f.fileName}</span>
-                      <span className="text-[10px] text-slate-400 dark:text-slate-500">
-                        {(f.fileSize / (1024 * 1024)).toFixed(2)} MB · {f.detectedMimeType}
-                      </span>
+                {submission.files.map((f) => {
+                  const isLegacyBlob =
+                    Boolean(f.downloadUrl?.startsWith('blob:')) ||
+                    Boolean(f.downloadUrl?.includes('storage.proofly.internal')) ||
+                    !fileStorageService.parseCanonicalStoragePath(f.storagePath);
+
+                  return (
+                    <div
+                      key={f.id}
+                      className="p-2.5 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-200 dark:border-slate-700/80 text-xs flex items-center justify-between gap-2"
+                    >
+                      <div className="truncate">
+                        <span className="font-semibold text-slate-800 dark:text-slate-200 block truncate">{f.fileName}</span>
+                        <span className="text-[10px] text-slate-400 dark:text-slate-500">
+                          {(f.fileSize / (1024 * 1024)).toFixed(2)} MB · {f.detectedMimeType || f.mimeType}
+                        </span>
+                      </div>
+                      {isLegacyBlob ? (
+                        <span className="text-[10px] font-medium text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-500/15 px-2 py-0.5 rounded border border-amber-200 dark:border-amber-500/30 shrink-0">
+                          Re-upload required
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              await fileStorageService.triggerBrowserDownload(f, {
+                                verifiedSession,
+                                participantUid: currentUser?.uid,
+                              });
+                            } catch (err: any) {
+                              toastError('Download Denied', err?.message || 'Unable to download artifact.');
+                            }
+                          }}
+                          title="Download verified artifact"
+                          className="text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 p-1 cursor-pointer"
+                        >
+                          <ExternalLink size={14} />
+                        </button>
+                      )}
                     </div>
-                    {f.downloadUrl && (
-                      <a
-                        href={f.downloadUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 p-1"
-                      >
-                        <ExternalLink size={14} />
-                      </a>
-                    )}
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </Card>
