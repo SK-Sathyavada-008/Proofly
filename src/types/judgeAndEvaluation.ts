@@ -110,6 +110,24 @@ export interface ReopenAuditRecord {
 }
 
 /**
+ * Proofly Phase 11 — Judge Evidence Annotation
+ * Allows judges to mark relevance, flag incorrect associations, disagree with AI,
+ * and record non-support rationales.
+ * Stored strictly separate from the original extracted evidence and immutable AI output.
+ */
+export interface JudgeEvidenceAnnotation {
+  evidenceId: string;
+  judgeId: string;
+  submissionId: string;
+  isRelevant?: boolean;
+  flaggedIncorrect?: boolean;
+  disagreeWithAi?: boolean;
+  notes?: string;
+  nonSupportReason?: string;
+  updatedAt: string;
+}
+
+/**
  * Human Judge Evaluation Record
  * STRICT RULE: Stored in isolation, NEVER overwrites the AI evaluation report.
  * Once submitted, locked and immutable unless reopened with organizer authorization.
@@ -144,6 +162,9 @@ export interface HumanJudgeEvaluation {
 
   // Flagged concern
   flaggedConcern?: FlaggedConcern;
+
+  // Phase 11 — Judge Evidence Annotations (Separate from AI output)
+  evidenceAnnotations?: Record<string, JudgeEvidenceAnnotation>;
 
   // Immutability & Status
   status: 'DRAFT' | 'SUBMITTED';

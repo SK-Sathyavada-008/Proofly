@@ -20,6 +20,7 @@ import {
   videoInspector,
 } from './extractors';
 import { fileStorageService } from './fileStorageService';
+import { evidenceExplorerService } from './evidenceExplorerService';
 
 export const contentExtractionService = {
   /**
@@ -155,7 +156,22 @@ export const contentExtractionService = {
       deploymentMetadata,
       videoMetadata,
       documentContents: extractedDocuments,
-      allEvidenceReferences,
+      allEvidenceReferences: evidenceExplorerService.buildConsistentEvidenceReferences({
+        submissionId: submission.id,
+        referenceId: submission.referenceId,
+        competitionId: submission.competitionId,
+        projectTitle: submission.projectTitle,
+        projectDescription: submission.projectDescription,
+        technologiesUsed: submission.technologiesUsed || [],
+        githubMetadata,
+        deploymentMetadata,
+        videoMetadata,
+        documentContents: extractedDocuments,
+        allEvidenceReferences,
+        normalizedExtractions,
+        evidenceDisclaimers: Array.from(new Set(disclaimers)),
+        assembledAt: new Date().toISOString(),
+      }),
       normalizedExtractions,
       evidenceDisclaimers: Array.from(new Set(disclaimers)),
       assembledAt: new Date().toISOString(),

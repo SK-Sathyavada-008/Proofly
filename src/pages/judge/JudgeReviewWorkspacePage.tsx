@@ -43,13 +43,18 @@ import { authorizationService } from '../../services/authorizationService';
 import { fileStorageService } from '../../services/fileStorageService';
 import { InferenceMode } from 'firebase/ai';
 import { AiEvaluationReportView } from '../../components/evaluation/AiEvaluationReportView';
-import type { AiEvaluationReport } from '../../types/aiEvaluation';
+import { EvidenceExplorerModal } from '../../components/evidence/EvidenceExplorerModal';
+import { EvidenceReferenceBadge } from '../../components/evidence/EvidenceReferenceBadge';
+import { evidenceExplorerService } from '../../services/evidenceExplorerService';
+import { contentExtractionService } from '../../services/contentExtractionService';
+import type { AiEvaluationReport, EvidenceReference } from '../../types/aiEvaluation';
 import type {
   JudgeAssignment,
   HumanJudgeEvaluation,
   ConflictType,
   ConcernCategory,
   CriterionComparisonDetail,
+  JudgeEvidenceAnnotation,
 } from '../../types/judgeAndEvaluation';
 
 const DEFAULT_FALLBACK_CRITERIA = [
@@ -77,6 +82,12 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
 
   // Full AI Dossier Modal
   const [isDossierModalOpen, setIsDossierModalOpen] = useState(false);
+
+  // Proofly Phase 11 — Evidence Explorer State
+  const [isEvidenceExplorerOpen, setIsEvidenceExplorerOpen] = useState(false);
+  const [selectedEvidenceId, setSelectedEvidenceId] = useState<string>('');
+  const [allEvidenceReferences, setAllEvidenceReferences] = useState<EvidenceReference[]>([]);
+  const [evidenceAnnotations, setEvidenceAnnotations] = useState<Record<string, JudgeEvidenceAnnotation>>({});
 
   // Effective Reviewer Identity (derived strictly from authenticated Firebase session)
   const judgeId = currentUser?.uid || verifiedSession?.uid || 'judge-direct-eval';
@@ -166,6 +177,16 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
           console.warn('Could not load AI report:', e);
         }
 
+        // 1b. Load Consistent Evidence References for Evidence Explorer
+        try {
+          const packet = await contentExtractionService.extractSubmissionEvidence(realSub);
+          if (packet.allEvidenceReferences && packet.allEvidenceReferences.length > 0) {
+            setAllEvidenceReferences(packet.allEvidenceReferences);
+          }
+        } catch (e) {
+          console.warn('Could not extract submission evidence references:', e);
+        }
+
         // 2. Load Assignment safely
         try {
           if (judgeId) {
@@ -186,6 +207,9 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
               setDecisionMode(existingEval.decisionMode);
               setDeductionNotes(existingEval.deductionNotes || '');
               setPrivateNotes(existingEval.privateNotes || '');
+              if (existingEval.evidenceAnnotations) {
+                setEvidenceAnnotations(existingEval.evidenceAnnotations);
+              }
             }
           }
         } catch (e) {
@@ -269,6 +293,35 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
     return diffs;
   };
 
+  const handleOpenEvidence = (ev?: EvidenceReference | string) => {
+    if (typeof ev === 'string') {
+      const match = allEvidenceReferences.find(
+        (r) =>
+          r.id === ev ||
+          r.sourceLocation === ev ||
+          r.locationReference === ev ||
+          r.location?.filePath === ev ||
+          (r.description && r.description.includes(ev))
+      );
+      if (match) {
+        setSelectedEvidenceId(match.id);
+      } else {
+        setSelectedEvidenceId(ev);
+      }
+    } else if (ev) {
+      setSelectedEvidenceId(ev.id);
+    }
+    setIsEvidenceExplorerOpen(true);
+  };
+
+  const handleSaveEvidenceAnnotation = (ann: JudgeEvidenceAnnotation) => {
+    evidenceExplorerService.saveJudgeAnnotation(ann);
+    setEvidenceAnnotations((prev) => ({
+      ...prev,
+      [ann.evidenceId]: ann,
+    }));
+  };
+
   const handleDecisionModeChange = (mode: 'AGREE' | 'MODIFY' | 'REJECT') => {
     if (isLocked) return;
     setDecisionMode(mode);
@@ -323,6 +376,7 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
         deductionNotes: deductionNotes?.trim() || 'Judge review draft in progress.',
         privateNotes,
         assignmentId: assignment?.id,
+        evidenceAnnotations,
       });
 
       setHumanEvaluation(draft);
@@ -369,6 +423,7 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
         deductionNotes: effectiveDeductionNotes,
         privateNotes,
         assignmentId: assignment?.id,
+        evidenceAnnotations,
       });
 
       setHumanEvaluation(submitted);
@@ -975,9 +1030,13 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
                     </div>
 
                     <div className="flex items-center gap-2">
-                      <Badge variant="success" size="sm" dot>
-                        AUDIT_VERIFIED
-                      </Badge>
+                      <Button
+                        variant="primary"
+                        size="xs"
+                        onClick={() => handleOpenEvidence()}
+                      >
+                        Evidence Explorer {allEvidenceReferences.length > 0 ? `(${allEvidenceReferences.length})` : ''}
+                      </Button>
                       <Button
                         variant="outline"
                         size="xs"
@@ -1019,12 +1078,39 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
                           )}
 
                           {/* Evidence References */}
-                          {crit.evidenceReferences && crit.evidenceReferences.length > 0 && (
-                            <div className="bg-slate-50 dark:bg-slate-900/60 p-2 rounded text-[11px] text-slate-600 dark:text-slate-400 space-y-0.5">
-                              <span className="font-semibold text-slate-700 dark:text-slate-300 block">Evidence References:</span>
-                              <span className="italic">{crit.evidenceReferences.join('; ')}</span>
+                          <div className="bg-slate-50 dark:bg-slate-900/60 p-2.5 rounded-lg text-[11px] text-slate-600 dark:text-slate-400 space-y-1.5 border border-slate-200/60 dark:border-slate-800">
+                            <div className="flex items-center justify-between">
+                              <span className="font-semibold text-slate-700 dark:text-slate-300">
+                                Supporting Evidence Citations:
+                              </span>
+                              {crit.evidenceReferences && crit.evidenceReferences.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenEvidence(crit.evidenceReferences[0])}
+                                  className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
+                                >
+                                  Open Explorer ↗
+                                </button>
+                              )}
                             </div>
-                          )}
+
+                            {crit.evidenceReferences && crit.evidenceReferences.length > 0 ? (
+                              <div className="flex flex-wrap gap-1.5 pt-0.5">
+                                {crit.evidenceReferences.map((refStr, idx) => (
+                                  <EvidenceReferenceBadge
+                                    key={idx}
+                                    evidence={refStr}
+                                    allReferences={allEvidenceReferences}
+                                    onClick={(ev) => handleOpenEvidence(ev)}
+                                  />
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="text-[11px] text-amber-700 dark:text-amber-300 italic bg-amber-50 dark:bg-amber-500/10 p-2 rounded border border-amber-200 dark:border-amber-500/30">
+                                No direct supporting evidence detected in submitted artifacts.
+                              </div>
+                            )}
+                          </div>
 
                           {/* Why marks were deducted */}
                           {crit.exactDeductionExplanations && crit.exactDeductionExplanations.length > 0 && (
@@ -1407,6 +1493,22 @@ export const JudgeReviewWorkspacePage: React.FC = () => {
           </div>
         </Modal>
       )}
+
+      {/* ── PHASE 11 EVIDENCE EXPLORER MODAL ── */}
+      <EvidenceExplorerModal
+        isOpen={isEvidenceExplorerOpen}
+        onClose={() => setIsEvidenceExplorerOpen(false)}
+        submissionId={submission.id}
+        projectTitle={submission.projectTitle}
+        initialEvidenceId={selectedEvidenceId}
+        allReferences={allEvidenceReferences}
+        submissionFiles={submission.files || []}
+        aiReport={aiReport}
+        judgeId={judgeId}
+        isJudgeLocked={isLocked}
+        annotations={evidenceAnnotations}
+        onSaveAnnotation={handleSaveEvidenceAnnotation}
+      />
 
 
       {/* ── CONFLICT OF INTEREST MODAL ── */}

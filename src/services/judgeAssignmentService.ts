@@ -40,6 +40,7 @@ import type {
   JudgeWorkloadSummary,
   FlaggedConcern,
   CriterionComparisonDetail,
+  JudgeEvidenceAnnotation,
 } from '../types/judgeAndEvaluation';
 import { submissionLifecycleService } from './submissionLifecycleService';
 import { submissionService } from './submissionService';
@@ -1117,6 +1118,7 @@ class JudgeAssignmentService {
       deductionNotes: string;
       privateNotes?: string;
       assignmentId?: string;
+      evidenceAnnotations?: Record<string, JudgeEvidenceAnnotation>;
     },
     options?: FirestoreExecutionOptions
   ): Promise<HumanJudgeEvaluation> {
@@ -1199,6 +1201,7 @@ class JudgeAssignmentService {
             criterionDifferences: payload.criterionDifferences,
             deductionNotes: payload.deductionNotes,
             privateNotes: payload.privateNotes,
+            evidenceAnnotations: payload.evidenceAnnotations || existing?.evidenceAnnotations || {},
             status: 'DRAFT',
             isLocked: false,
             savedAsDraftAt: now,
@@ -1264,6 +1267,7 @@ class JudgeAssignmentService {
       criterionDifferences: payload.criterionDifferences,
       deductionNotes: payload.deductionNotes,
       privateNotes: payload.privateNotes,
+      evidenceAnnotations: payload.evidenceAnnotations || existing?.evidenceAnnotations || {},
       status: 'DRAFT',
       isLocked: false,
       savedAsDraftAt: now,
@@ -1323,6 +1327,7 @@ class JudgeAssignmentService {
       deductionNotes: string;
       privateNotes?: string;
       assignmentId?: string;
+      evidenceAnnotations?: Record<string, JudgeEvidenceAnnotation>;
     },
     options?: FirestoreExecutionOptions
   ): Promise<HumanJudgeEvaluation> {
@@ -1405,6 +1410,7 @@ class JudgeAssignmentService {
             criterionDifferences: payload.criterionDifferences,
             deductionNotes: payload.deductionNotes,
             privateNotes: payload.privateNotes,
+            evidenceAnnotations: payload.evidenceAnnotations || existing.evidenceAnnotations || {},
             source: 'HUMAN',
             status: 'SUBMITTED',
             isLocked: true,
@@ -1546,6 +1552,7 @@ class JudgeAssignmentService {
       criterionDifferences: payload.criterionDifferences,
       deductionNotes: payload.deductionNotes,
       privateNotes: payload.privateNotes,
+      evidenceAnnotations: payload.evidenceAnnotations || existing?.evidenceAnnotations || {},
       status: 'SUBMITTED',
       isLocked: true,
       submittedAt: now,

@@ -991,24 +991,37 @@ ${projectSummary.trim()}
       const rawConfidence = (['HIGH', 'MEDIUM', 'LOW'].includes(found?.confidence) ? found.confidence : 'HIGH') as 'HIGH' | 'MEDIUM' | 'LOW';
       const adjustedConfidence = isFallbackOutcome ? (rawConfidence === 'LOW' ? 'LOW' : 'MEDIUM') : rawConfidence;
 
+      const hasAnyArtifacts = (packet.documentContents?.length || 0) > 0 || Boolean(packet.githubMetadata?.accessible) || Boolean(packet.deploymentMetadata?.accessible);
+      const rawEvidenceRefs = Array.isArray(found?.evidenceReferences) ? found.evidenceReferences.filter(Boolean) : [];
+      const resolvedEvidenceRefs = rawEvidenceRefs.length > 0
+        ? rawEvidenceRefs
+        : hasAnyArtifacts
+        ? packet.documentContents.map((d) => d.fileName)
+        : [];
+
+      const rawMissingEvidence = Array.isArray(found?.missingEvidence) && found.missingEvidence.length > 0
+        ? found.missingEvidence
+        : (baseCrit?.missingEvidence || []);
+      const resolvedMissingEvidence = resolvedEvidenceRefs.length === 0 && rawMissingEvidence.length === 0
+        ? ['No direct supporting evidence detected in submitted artifacts.']
+        : rawMissingEvidence;
+
+      const fallbackExplanation = resolvedEvidenceRefs.length === 0
+        ? 'No direct supporting evidence detected in submitted artifacts for this criterion.'
+        : (deductions.length > 0 ? deductions.join(' ') : positiveObservations[0] || 'Evaluated against submitted criteria.');
+
       return {
         criterionId: crit.id,
         criterionName: crit.name,
         suggestedScore,
         maxScore,
         weight: crit.weight,
-        explanation:
-          found?.explanation ||
-          (deductions.length > 0 ? deductions.join(' ') : positiveObservations[0] || 'Evaluated against submitted criteria.'),
+        explanation: found?.explanation || fallbackExplanation,
         positiveObservations,
-        evidenceReferences: Array.isArray(found?.evidenceReferences) && found.evidenceReferences.length > 0
-          ? found.evidenceReferences
-          : [packet.projectTitle, ...packet.documentContents.map((d) => d.fileName)],
+        evidenceReferences: resolvedEvidenceRefs,
         weaknesses: deductions.length > 0 ? deductions : (Array.isArray(found?.weaknesses) ? found.weaknesses : []),
         exactDeductionExplanations: deductions,
-        missingEvidence: Array.isArray(found?.missingEvidence) && found.missingEvidence.length > 0
-          ? found.missingEvidence
-          : (baseCrit?.missingEvidence || []),
+        missingEvidence: resolvedMissingEvidence,
         uncertainty:
           found?.uncertainty ||
           (isFallbackOutcome
@@ -1904,22 +1917,31 @@ Format your response as a valid JSON object matching this structure:
       const suggestedScore = Math.max(1, maxScore - totalDeductedPoints);
       const criterionConfidence: 'MEDIUM' | 'LOW' = isExplicitWeak ? 'LOW' : 'MEDIUM';
 
+      const hasArtifacts = hasGithub || hasDocs || Boolean(packet.deploymentMetadata?.accessible);
+      const deterministicEvidenceRefs = hasArtifacts
+        ? [
+            ...(hasGithub ? ['GitHub Repository'] : []),
+            ...(hasDocs ? packet.documentContents.map((d) => d.fileName) : []),
+          ]
+        : [];
+      const deterministicMissing = deterministicEvidenceRefs.length === 0
+        ? [...missingEvidence, 'No direct supporting evidence detected in submitted artifacts.']
+        : missingEvidence;
+      const deterministicExplanation = deterministicEvidenceRefs.length === 0
+        ? 'No direct supporting evidence detected in submitted artifacts for this criterion.'
+        : (deductions.length > 0 ? deductions.join(' ') : positiveObs[0] || `Evaluated against ${crit.name} criteria.`);
+
       return {
         criterionId: crit.id,
         criterionName: crit.name,
         suggestedScore,
         maxScore,
-        explanation:
-          deductions.length > 0 ? deductions.join(' ') : positiveObs[0] || `Evaluated against ${crit.name} criteria.`,
+        explanation: deterministicExplanation,
         positiveObservations: positiveObs,
-        evidenceReferences: [
-          title,
-          ...(hasGithub ? ['GitHub Repository'] : []),
-          ...(hasDocs ? packet.documentContents.map((d) => d.fileName) : []),
-        ],
+        evidenceReferences: deterministicEvidenceRefs,
         weaknesses: deductions.length > 0 ? deductions : ['Could provide further edge-case stress benchmarks.'],
         exactDeductionExplanations: deductions,
-        missingEvidence,
+        missingEvidence: deterministicMissing,
         uncertainty: 'Deterministic heuristic evaluation cannot verify deep semantic code correctness or architectural nuance.',
         confidence: criterionConfidence,
         confidenceJustification: isExplicitWeak

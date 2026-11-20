@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent } from '../ui/Card';
 import { Badge } from '../ui/Badge';
+import { EvidenceReferenceBadge } from '../evidence/EvidenceReferenceBadge';
 import type { AiEvaluationReport, EvidenceClassification } from '../../types/aiEvaluation';
 
 interface AiEvaluationReportViewProps {
@@ -344,6 +345,20 @@ export const AiEvaluationReportView: React.FC<AiEvaluationReportViewProps> = ({ 
                             </li>
                           ))}
                         </ul>
+                      </div>
+                    )}
+
+                    {/* Supporting Evidence References */}
+                    {crit.evidenceReferences && crit.evidenceReferences.length > 0 && (
+                      <div className="space-y-1.5 pt-1">
+                        <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                          Supporting Evidence Citations:
+                        </span>
+                        <div className="flex flex-wrap gap-1.5">
+                          {crit.evidenceReferences.map((refStr, idx) => (
+                            <EvidenceReferenceBadge key={idx} evidence={refStr} />
+                          ))}
+                        </div>
                       </div>
                     )}
 

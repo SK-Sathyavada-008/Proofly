@@ -46,14 +46,44 @@ export interface EvidenceLocation {
 }
 
 /**
+ * Strict evidence classification per hackathon guidelines.
+ * Models must never invent evidence or claim uninspected files were analyzed.
+ */
+export type EvidenceClassification =
+  // Official Phase 11 / Phase 07 taxonomy:
+  | 'VERIFIED_EVIDENCE'
+  | 'CLAIM_ONLY'
+  | 'MISSING_EVIDENCE'
+  | 'INACCESSIBLE_EVIDENCE'
+  | 'UNCLEAR_EVIDENCE'
+  | 'NOT_INSPECTED'
+  // Backward-compatibility aliases:
+  | 'EVIDENCE_VERIFIED'
+  | 'FEATURE_CLAIMED_BUT_NOT_DEMONSTRATED'
+  | 'FEATURE_DEMONSTRABLY_ABSENT'
+  | 'EVIDENCE_UNAVAILABLE'
+  | 'CONTENT_UNCLEAR'
+  | 'TECHNICAL_BEHAVIOR_NOT_TESTED';
+
+/**
  * Traceable, verified evidence reference linked to an exact source artifact.
+ * Conforms to Proofly Phase 11 consistent evidence model.
  */
 export interface EvidenceReference {
   id: string;
+  submissionId?: string;
   artifactId: string;
   artifactType: ArtifactType;
+  sourceLocation?: string;
+  extractedPassage?: string;
+  locationReference?: string;
   location: EvidenceLocation;
   snippet: string;
+  contentHash?: string;
+  extractionStatus?: ExtractionStatus;
+  extractionTimestamp?: string;
+  classification?: EvidenceClassification;
+  metadata?: Record<string, unknown>;
   description?: string;
 }
 

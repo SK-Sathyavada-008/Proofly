@@ -8,29 +8,17 @@ import type {
   EvidenceReference,
   NormalizedExtractionResult,
   ExtractionStatus,
+  ArtifactType,
+  EvidenceClassification,
 } from '../services/extractors/types';
 
-export type { EvidenceReference, NormalizedExtractionResult, ExtractionStatus };
-
-/**
- * Strict evidence classification per hackathon guidelines.
- * Models must never invent evidence or claim uninspected files were analyzed.
- */
-export type EvidenceClassification =
-  // Official Phase 07 taxonomy:
-  | 'VERIFIED_EVIDENCE'
-  | 'CLAIM_ONLY'
-  | 'MISSING_EVIDENCE'
-  | 'INACCESSIBLE_EVIDENCE'
-  | 'UNCLEAR_EVIDENCE'
-  | 'NOT_INSPECTED'
-  // Backward-compatibility aliases:
-  | 'EVIDENCE_VERIFIED'
-  | 'FEATURE_CLAIMED_BUT_NOT_DEMONSTRATED'
-  | 'FEATURE_DEMONSTRABLY_ABSENT'
-  | 'EVIDENCE_UNAVAILABLE'
-  | 'CONTENT_UNCLEAR'
-  | 'TECHNICAL_BEHAVIOR_NOT_TESTED';
+export type {
+  EvidenceReference,
+  NormalizedExtractionResult,
+  ExtractionStatus,
+  ArtifactType,
+  EvidenceClassification,
+};
 
 /**
  * Explicit evaluation outcome separating real AI from fallbacks and failures.
