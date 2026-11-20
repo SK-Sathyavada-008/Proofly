@@ -33,6 +33,7 @@ import { OrganizerSettingsPage } from './pages/organizer/OrganizerSettingsPage';
 // Judge Pages
 import { JudgeAssignmentListPage } from './pages/judge/JudgeAssignmentListPage';
 import { JudgeReviewWorkspacePage } from './pages/judge/JudgeReviewWorkspacePage';
+import { JudgeCalibrationPage } from './pages/judge/JudgeCalibrationPage';
 import { JudgeHistoryPage } from './pages/judge/JudgeHistoryPage';
 
 // Participant Pages
@@ -89,6 +90,7 @@ export default function App() {
           <Route index element={<Navigate to="/judge/assignments" replace />} />
           <Route path="assignments" element={<JudgeAssignmentListPage />} />
           <Route path="review" element={<JudgeReviewWorkspacePage />} />
+          <Route path="calibration" element={<JudgeCalibrationPage />} />
           <Route path="history" element={<JudgeHistoryPage />} />
           <Route path="*" element={<Navigate to="/judge/assignments" replace />} />
         </Route>

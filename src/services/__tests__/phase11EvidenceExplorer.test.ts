@@ -232,7 +232,7 @@ describe('Proofly Phase 11 — Evidence Explorer & AI Traceability', () => {
 
       const notInspected = service.getClassificationDetails('NOT_INSPECTED');
       expect(notInspected.label).toBe('Not Inspected');
-      expect(notInspected.badgeVariant).toBe('info');
+      expect(notInspected.badgeVariant).toBe('primary');
     });
   });
 

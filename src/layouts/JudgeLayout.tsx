@@ -9,6 +9,7 @@ export const JudgeLayout: React.FC = () => {
   const judgeTabs = [
     { label: 'Assignments', to: '/judge/assignments' },
     { label: 'Review', to: '/judge/review' },
+    { label: 'Calibration', to: '/judge/calibration' },
     { label: 'History', to: '/judge/history' },
   ];
 

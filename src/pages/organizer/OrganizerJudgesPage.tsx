@@ -8,6 +8,11 @@ import {
   Plus,
   ArrowRightLeft,
   ShieldAlert,
+  Target,
+  Scale,
+  CheckCircle2,
+  Eye,
+  Award,
 } from 'lucide-react';
 import { PageHeader } from '../../components/ui/PageHeader';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../../components/ui/Table';
@@ -15,7 +20,7 @@ import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
 import { Modal } from '../../components/ui/Modal';
 import { Input } from '../../components/ui/Input';
-import { Card, CardHeader, CardTitle } from '../../components/ui/Card';
+import { Card, CardHeader, CardTitle, CardContent } from '../../components/ui/Card';
 import { useToast } from '../../components/ui/Toast';
 import { useProoflyAuth } from '../../context/ProoflyAuthContext';
 import { judgeAssignmentService } from '../../services/judgeAssignmentService';
@@ -23,6 +28,9 @@ import { submissionService } from '../../services/submissionService';
 import { competitionService } from '../../services/competitionService';
 import { authorizationService } from '../../services/authorizationService';
 import { invitationService } from '../../services/invitationService';
+import { calibrationAndDisagreementService } from '../../services/calibrationAndDisagreementService';
+import { AdjudicationModal } from '../../components/adjudication/AdjudicationModal';
+import { CreateCalibrationModal } from '../../components/calibration/CreateCalibrationModal';
 import type {
   JudgeRecord,
   JudgeAssignment,
@@ -30,10 +38,19 @@ import type {
 } from '../../types/judgeAndEvaluation';
 import type { ProjectSubmission } from '../../types/submission';
 import type { Competition } from '../../types/authAndCompetition';
+import type {
+  CalibrationExercise,
+  CriterionDisagreement,
+  SubmissionDisagreementAnalysis,
+  CompetitionDisagreementAnalytics,
+  DisputeSeverity,
+} from '../../types/calibrationAndDisagreement';
 
 export const OrganizerJudgesPage: React.FC = () => {
   const { currentUser, verifiedSession, activeOrganization } = useProoflyAuth();
   const { success, warning, error: toastError } = useToast();
+
+  const [activeSubTab, setActiveSubTab] = useState<'panel' | 'calibration' | 'disagreement'>('panel');
 
   const [judges, setJudges] = useState<JudgeRecord[]>([]);
   const [workloads, setWorkloads] = useState<JudgeWorkloadSummary[]>([]);
@@ -42,6 +59,18 @@ export const OrganizerJudgesPage: React.FC = () => {
   const [allSubmissions, setAllSubmissions] = useState<ProjectSubmission[]>([]);
   const [allAssignments, setAllAssignments] = useState<JudgeAssignment[]>([]);
   const [, setLoading] = useState(true);
+
+  // Calibration State
+  const [calibrationExercises, setCalibrationExercises] = useState<CalibrationExercise[]>([]);
+  const [createCalibrationModalOpen, setCreateCalibrationModalOpen] = useState(false);
+  const [selectedExerciseForDetail, setSelectedExerciseForDetail] = useState<CalibrationExercise | null>(null);
+
+  // Disagreement State
+  const [disagreementAnalyses, setDisagreementAnalyses] = useState<SubmissionDisagreementAnalysis[]>([]);
+  const [disagreementAnalytics, setDisagreementAnalytics] = useState<CompetitionDisagreementAnalytics | null>(null);
+  const [adjudicationModalOpen, setAdjudicationModalOpen] = useState(false);
+  const [selectedDisagreementAnalysis, setSelectedDisagreementAnalysis] = useState<SubmissionDisagreementAnalysis | null>(null);
+  const [severityFilter, setSeverityFilter] = useState<'ALL' | DisputeSeverity>('ALL');
 
   // Invite / Add Judge Modal
   const [inviteModalOpen, setInviteModalOpen] = useState(false);
@@ -93,6 +122,23 @@ export const OrganizerJudgesPage: React.FC = () => {
       // 4. Assignments
       const asgns = await judgeAssignmentService.listAssignments({ competitionId: selectedCompId });
       setAllAssignments(asgns);
+
+      // 5. Calibration Exercises
+      const exList = await calibrationAndDisagreementService.listCalibrationExercises(selectedCompId);
+      setCalibrationExercises(exList);
+
+      // 6. Disagreements & Analytics
+      const targetComp = selectedCompId === 'ALL' && comps.length > 0 ? comps[0].id : selectedCompId;
+      if (targetComp && targetComp !== 'ALL') {
+        const analyses = await calibrationAndDisagreementService.detectCompetitionDisagreements(targetComp);
+        setDisagreementAnalyses(analyses);
+
+        const analytics = await calibrationAndDisagreementService.getCompetitionDisagreementAnalytics(targetComp);
+        setDisagreementAnalytics(analytics);
+      } else {
+        setDisagreementAnalyses([]);
+        setDisagreementAnalytics(null);
+      }
     } catch (err: any) {
       console.warn('Error loading judge coordination data:', err);
     } finally {
@@ -305,10 +351,15 @@ export const OrganizerJudgesPage: React.FC = () => {
   const totalInProgressReviews = allAssignments.filter((a) => a.status === 'IN_PROGRESS').length;
   const totalConflictsDeclared = allAssignments.filter((a) => a.status === 'CONFLICT').length;
 
+  const filteredDisagreements = disagreementAnalyses.filter((ana) => {
+    if (severityFilter === 'ALL') return true;
+    return ana.disputeSeverity === severityFilter;
+  });
+
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Judges"
+        title="Judges & Evaluation Quality"
         actions={
           <div className="flex items-center gap-2">
             <select
@@ -323,27 +374,96 @@ export const OrganizerJudgesPage: React.FC = () => {
                 </option>
               ))}
             </select>
-            {currentUser && !judges.some((j) => j.id === currentUser.uid || j.email.toLowerCase() === currentUser.email?.toLowerCase()) && (
+            {activeSubTab === 'calibration' ? (
               <Button
-                variant="outline"
+                variant="primary"
                 size="xs"
                 leftIcon={<Plus size={13} />}
-                onClick={handleAddMyselfAsJudge}
+                onClick={() => setCreateCalibrationModalOpen(true)}
               >
-                Add myself as judge
+                Create exercise
               </Button>
+            ) : (
+              <>
+                {currentUser && !judges.some((j) => j.id === currentUser.uid || j.email.toLowerCase() === currentUser.email?.toLowerCase()) && (
+                  <Button
+                    variant="outline"
+                    size="xs"
+                    leftIcon={<Plus size={13} />}
+                    onClick={handleAddMyselfAsJudge}
+                  >
+                    Add myself as judge
+                  </Button>
+                )}
+                <Button
+                  variant="primary"
+                  size="xs"
+                  leftIcon={<Plus size={13} />}
+                  onClick={() => setInviteModalOpen(true)}
+                >
+                  Invite judge
+                </Button>
+              </>
             )}
-            <Button
-              variant="primary"
-              size="xs"
-              leftIcon={<Plus size={13} />}
-              onClick={() => setInviteModalOpen(true)}
-            >
-              Invite judge
-            </Button>
           </div>
         }
       />
+
+      {/* Sub-Tabs Switcher */}
+      <div className="flex border-b border-slate-200 dark:border-slate-800 space-x-6 text-xs font-medium">
+        <button
+          type="button"
+          onClick={() => setActiveSubTab('panel')}
+          className={`pb-2.5 border-b-2 flex items-center gap-2 transition-colors ${
+            activeSubTab === 'panel'
+              ? 'border-blue-600 text-blue-600 dark:text-blue-400 font-semibold'
+              : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400'
+          }`}
+        >
+          <Award className="w-3.5 h-3.5" />
+          Judges Panel & Workload
+          <Badge variant="outline" size="sm">
+            {judges.length}
+          </Badge>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveSubTab('calibration')}
+          className={`pb-2.5 border-b-2 flex items-center gap-2 transition-colors ${
+            activeSubTab === 'calibration'
+              ? 'border-blue-600 text-blue-600 dark:text-blue-400 font-semibold'
+              : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400'
+          }`}
+        >
+          <Target className="w-3.5 h-3.5" />
+          Calibration Exercises
+          <Badge variant="outline" size="sm">
+            {calibrationExercises.length}
+          </Badge>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveSubTab('disagreement')}
+          className={`pb-2.5 border-b-2 flex items-center gap-2 transition-colors ${
+            activeSubTab === 'disagreement'
+              ? 'border-blue-600 text-blue-600 dark:text-blue-400 font-semibold'
+              : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400'
+          }`}
+        >
+          <Scale className="w-3.5 h-3.5" />
+          Disagreement & Adjudication
+          {disagreementAnalyses.filter((a) => a.isOverallDisputed).length > 0 && (
+            <Badge variant="danger" size="sm">
+              {disagreementAnalyses.filter((a) => a.isOverallDisputed).length} disputed
+            </Badge>
+          )}
+        </button>
+      </div>
+
+      {activeSubTab === 'panel' && (
+        <div className="space-y-5">
 
       <div className="grid grid-cols-2 sm:grid-cols-5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-xs divide-y sm:divide-y-0 sm:divide-x divide-slate-200 dark:divide-slate-800">
         <div className="p-3.5">
@@ -511,6 +631,323 @@ export const OrganizerJudgesPage: React.FC = () => {
           </TableBody>
         </Table>
       </Card>
+        </div>
+      )}
+
+      {/* ── SUB-TAB 2: CALIBRATION EXERCISES ── */}
+      {activeSubTab === 'calibration' && (
+        <div className="space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white dark:bg-slate-900 p-4 rounded-xl border border-slate-200 dark:border-slate-800 shadow-xs">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                <Target className="w-4 h-4 text-blue-500" />
+                Judge Calibration & Benchmark Exercises
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                Standardize human evaluation criteria. Reference scores and justifications remain strictly blinded to judges until submission.
+              </p>
+            </div>
+            <Button
+              variant="primary"
+              size="sm"
+              leftIcon={<Plus className="w-4 h-4" />}
+              onClick={() => setCreateCalibrationModalOpen(true)}
+            >
+              Create Calibration Exercise
+            </Button>
+          </div>
+
+          {calibrationExercises.length === 0 ? (
+            <Card className="p-8 text-center bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800">
+              <div className="max-w-md mx-auto space-y-3">
+                <div className="w-12 h-12 rounded-xl bg-blue-50 dark:bg-blue-950/40 text-blue-600 dark:text-blue-400 flex items-center justify-center mx-auto">
+                  <Target className="w-6 h-6" />
+                </div>
+                <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                  No Calibration Exercises Created
+                </h4>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Create a sample submission exercise with hidden benchmark scores to measure judge consistency and identify rubric confusion before official scoring begins.
+                </p>
+                <Button
+                  variant="primary"
+                  size="xs"
+                  onClick={() => setCreateCalibrationModalOpen(true)}
+                >
+                  Create First Exercise
+                </Button>
+              </div>
+            </Card>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {calibrationExercises.map((ex) => (
+                <Card
+                  key={ex.id}
+                  className="bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 flex flex-col justify-between"
+                >
+                  <CardHeader className="p-4 pb-2">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <Badge variant="outline" size="sm">
+                        {ex.competitionId}
+                      </Badge>
+                      <Badge
+                        variant={ex.status === 'ACTIVE' ? 'success' : 'neutral'}
+                        size="sm"
+                      >
+                        {ex.status}
+                      </Badge>
+                    </div>
+                    <CardTitle className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                      {ex.title}
+                    </CardTitle>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-2 mt-1">
+                      {ex.description}
+                    </p>
+                  </CardHeader>
+                  <CardContent className="p-4 pt-2 border-t border-slate-100 dark:border-slate-800 space-y-3">
+                    <div className="bg-slate-50 dark:bg-slate-800/60 p-2.5 rounded-lg border border-slate-200 dark:border-slate-700/80 text-xs">
+                      <span className="font-medium text-slate-700 dark:text-slate-300 block">
+                        Sample Project: {ex.sampleProject.title}
+                      </span>
+                      <span className="text-slate-400 text-[11px] block mt-0.5">
+                        Track: {ex.sampleProject.track} · {ex.sampleProject.artifacts?.length || 0} artifacts · {ex.rubric.length} criteria
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between pt-1">
+                      <span className="text-[11px] text-slate-400">
+                        Created {new Date(ex.createdAt).toLocaleDateString()}
+                      </span>
+                      <Button
+                        variant="outline"
+                        size="xs"
+                        leftIcon={<Eye className="w-3.5 h-3.5" />}
+                        onClick={() => setSelectedExerciseForDetail(ex)}
+                      >
+                        Inspect Benchmarks
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── SUB-TAB 3: DISAGREEMENT & ADJUDICATION ── */}
+      {activeSubTab === 'disagreement' && (
+        <div className="space-y-4">
+          {/* Analytics Banner */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-xs divide-y sm:divide-y-0 sm:divide-x divide-slate-200 dark:divide-slate-800">
+            <div className="p-3.5">
+              <p className="text-xs text-slate-500 dark:text-slate-400">Evaluated Projects</p>
+              <p className="text-lg font-semibold font-mono text-slate-900 dark:text-slate-100 mt-0.5">
+                {disagreementAnalytics?.totalSubmissionsReviewed ?? 0}
+              </p>
+            </div>
+            <div className="p-3.5">
+              <p className="text-xs text-slate-500 dark:text-slate-400">Panel Consensus</p>
+              <p className="text-lg font-semibold font-mono text-emerald-600 dark:text-emerald-400 mt-0.5">
+                {disagreementAnalytics && disagreementAnalytics.totalSubmissionsReviewed > 0
+                  ? `${Math.round((disagreementAnalytics.consensusSubmissionsCount / disagreementAnalytics.totalSubmissionsReviewed) * 100)}%`
+                  : '100%'}
+              </p>
+            </div>
+            <div className="p-3.5">
+              <p className="text-xs text-slate-500 dark:text-slate-400">Disputed Submissions</p>
+              <p className="text-lg font-semibold font-mono text-rose-600 dark:text-rose-400 mt-0.5">
+                {disagreementAnalytics?.disputedSubmissionsCount ?? 0}
+              </p>
+            </div>
+            <div className="p-3.5">
+              <p className="text-xs text-slate-500 dark:text-slate-400">Mean Score Variance</p>
+              <p className="text-lg font-semibold font-mono text-indigo-600 dark:text-indigo-400 mt-0.5">
+                {disagreementAnalytics?.meanPanelVariance.toFixed(2) ?? '0.00'}
+              </p>
+            </div>
+          </div>
+
+          {/* Table Header & Filter */}
+          <Card className="border-slate-200 dark:border-slate-800 overflow-hidden bg-white dark:bg-slate-900">
+            <CardHeader className="py-3 px-4 border-b border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <CardTitle className="text-sm font-medium text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                  <Scale className="w-4 h-4 text-amber-500" />
+                  Score Disagreement & Variance Studio
+                </CardTitle>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  Flags high variance, contradictory marks, and missing reviews across human evaluations. Original evaluations are strictly preserved.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-400">Severity:</span>
+                {(['ALL', 'CRITICAL', 'HIGH', 'MODERATE', 'LOW', 'NONE'] as const).map((sev) => (
+                  <button
+                    key={sev}
+                    onClick={() => setSeverityFilter(sev)}
+                    className={`text-xs px-2.5 py-1 rounded-md font-medium transition-colors ${
+                      severityFilter === sev
+                        ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900'
+                        : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
+                    }`}
+                  >
+                    {sev}
+                  </button>
+                ))}
+              </div>
+            </CardHeader>
+
+            {filteredDisagreements.length === 0 ? (
+              <div className="p-8 text-center">
+                <CheckCircle2 className="w-8 h-8 text-emerald-500 mx-auto mb-2 opacity-80" />
+                <p className="text-sm font-medium text-slate-800 dark:text-slate-200">
+                  No Disagreements Detected
+                </p>
+                <p className="text-xs text-slate-400 mt-1">
+                  All multi-judge evaluations are within the configured variance threshold.
+                </p>
+              </div>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Submission</TableHead>
+                    <TableHead>Reviewers</TableHead>
+                    <TableHead>Score Spread</TableHead>
+                    <TableHead>Variance (s²)</TableHead>
+                    <TableHead>Disputed Criteria</TableHead>
+                    <TableHead>Severity</TableHead>
+                    <TableHead>Adjudication</TableHead>
+                    <TableHead className="text-right">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {filteredDisagreements.map((ana) => {
+                    const disputedCriteriaNames = ana.criterionDisagreements
+                      .filter((c: CriterionDisagreement) => c.isDisputed)
+                      .map((c: CriterionDisagreement) => c.criterionName);
+
+                    const judgeTotalScores = ana.judges.map((j) => j.totalScore);
+                    const minScore = judgeTotalScores.length > 0 ? Math.min(...judgeTotalScores) : 0;
+                    const maxScore = judgeTotalScores.length > 0 ? Math.max(...judgeTotalScores) : 0;
+
+                    return (
+                      <TableRow key={ana.submissionId}>
+                        <TableCell>
+                          <div>
+                            <span className="font-semibold text-xs text-slate-900 dark:text-slate-100 block">
+                              {ana.projectTitle}
+                            </span>
+                            <span className="font-mono text-[11px] text-slate-400">
+                              {ana.referenceId}
+                            </span>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                              {ana.completedJudgesCount}
+                            </span>
+                            <span className="text-[11px] text-slate-400">
+                              / {ana.assignedJudgesCount} judges
+                            </span>
+                            {ana.hasMissingEvaluations && (
+                              <Badge variant="warning" size="sm">
+                                Missing
+                              </Badge>
+                            )}
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <div className="text-xs">
+                            <span className="font-mono font-semibold text-slate-800 dark:text-slate-200">
+                              {minScore.toFixed(1)} – {maxScore.toFixed(1)}
+                            </span>
+                            <span className="text-slate-400 text-[11px] block">
+                              Avg: {ana.overallMeanScore.toFixed(1)} (Δ {ana.overallScoreSpread.toFixed(1)})
+                            </span>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <span
+                            className={`font-mono text-xs font-semibold ${
+                              ana.overallVariance >= 15
+                                ? 'text-rose-600 dark:text-rose-400'
+                                : ana.overallVariance >= 8
+                                ? 'text-amber-600 dark:text-amber-400'
+                                : 'text-slate-600 dark:text-slate-400'
+                            }`}
+                          >
+                            {ana.overallVariance.toFixed(2)}
+                          </span>
+                        </TableCell>
+                        <TableCell>
+                          {disputedCriteriaNames.length > 0 ? (
+                            <div className="flex flex-wrap gap-1 max-w-[200px]">
+                              {disputedCriteriaNames.map((name: string) => (
+                                <Badge key={name} variant="danger" size="sm">
+                                  {name}
+                                </Badge>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="text-[11px] text-slate-400 italic">None</span>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          <Badge
+                            variant={
+                              ana.disputeSeverity === 'CRITICAL'
+                                ? 'danger'
+                                : ana.disputeSeverity === 'HIGH'
+                                ? 'warning'
+                                : ana.disputeSeverity === 'MODERATE'
+                                ? 'warning'
+                                : 'neutral'
+                            }
+                            size="sm"
+                          >
+                            {ana.disputeSeverity}
+                          </Badge>
+                        </TableCell>
+                        <TableCell>
+                          <Badge
+                            variant={
+                              ana.adjudicationStatus === 'ADJUDICATED'
+                                ? 'success'
+                                : ana.adjudicationStatus === 'CLARIFICATION_REQUESTED'
+                                ? 'warning'
+                                : 'neutral'
+                            }
+                            size="sm"
+                          >
+                            {ana.adjudicationStatus}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <Button
+                            variant="primary"
+                            size="xs"
+                            leftIcon={<Scale className="w-3.5 h-3.5" />}
+                            onClick={() => {
+                              setSelectedDisagreementAnalysis(ana);
+                              setAdjudicationModalOpen(true);
+                            }}
+                          >
+                            Inspect & Adjudicate
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            )}
+          </Card>
+        </div>
+      )}
 
       {/* ── 1. INVITE / ADD JUDGE MODAL ── */}
       <Modal
@@ -907,6 +1344,97 @@ export const OrganizerJudgesPage: React.FC = () => {
           </div>
         </div>
       </Modal>
+
+      {/* ── 5. CALIBRATION EXERCISE CREATION MODAL ── */}
+      <CreateCalibrationModal
+        isOpen={createCalibrationModalOpen}
+        onClose={() => setCreateCalibrationModalOpen(false)}
+        competitions={competitions}
+        selectedCompId={selectedCompId}
+        creatorId={currentUser?.uid || 'organizer'}
+        creatorName={currentUser?.displayName || 'Organizer'}
+        onExerciseCreated={async (ex) => {
+          setCalibrationExercises((prev) => [ex, ...prev]);
+          await loadAllData();
+        }}
+      />
+
+      {/* ── 6. ADJUDICATION & DISAGREEMENT MODAL ── */}
+      <AdjudicationModal
+        isOpen={adjudicationModalOpen}
+        onClose={() => {
+          setAdjudicationModalOpen(false);
+          setSelectedDisagreementAnalysis(null);
+        }}
+        analysis={selectedDisagreementAnalysis}
+        adjudicatorId={currentUser?.uid || 'organizer'}
+        adjudicatorName={currentUser?.displayName || 'Organizer Adjudicator'}
+        adjudicatorRole="ORGANIZER"
+        onAdjudicationSaved={async () => {
+          await loadAllData();
+        }}
+      />
+
+      {/* ── 7. BENCHMARK DETAIL INSPECTION MODAL ── */}
+      {selectedExerciseForDetail && (
+        <Modal
+          isOpen={!!selectedExerciseForDetail}
+          onClose={() => setSelectedExerciseForDetail(null)}
+          title={`Calibration Benchmarks: ${selectedExerciseForDetail.title}`}
+          description="Organizer-only benchmark reference scores and justifications. Hidden from judges until after submission."
+          footer={
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setSelectedExerciseForDetail(null)}
+            >
+              Close
+            </Button>
+          }
+        >
+          <div className="space-y-4">
+            <div className="bg-slate-50 dark:bg-slate-800/60 p-3 rounded-lg border border-slate-200 dark:border-slate-700/80 text-xs space-y-1">
+              <span className="font-semibold text-slate-800 dark:text-slate-100 block">
+                Sample Project: {selectedExerciseForDetail.sampleProject.title}
+              </span>
+              <p className="text-slate-500 dark:text-slate-400">
+                {selectedExerciseForDetail.sampleProject.description}
+              </p>
+            </div>
+
+            <div>
+              <h4 className="text-xs font-semibold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-2">
+                Benchmark Criteria & Justifications
+              </h4>
+              <div className="space-y-2">
+                {selectedExerciseForDetail.rubric.map((c) => {
+                  const benchmarkScore = selectedExerciseForDetail.referenceScores[c.id];
+                  const benchmarkReason = selectedExerciseForDetail.referenceReasoning[c.id];
+
+                  return (
+                    <div
+                      key={c.id}
+                      className="p-3 bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700/80 space-y-1.5"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-xs text-slate-900 dark:text-slate-100">
+                          {c.name}
+                        </span>
+                        <span className="font-mono text-xs font-bold text-blue-600 dark:text-blue-400">
+                          {benchmarkScore} / {c.maxScore} pts
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-600 dark:text-slate-300">
+                        {benchmarkReason || 'No reference justification documented.'}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 };
