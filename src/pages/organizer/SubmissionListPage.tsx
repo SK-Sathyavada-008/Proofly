@@ -36,6 +36,7 @@ import { submissionLifecycleService } from '../../services/submissionLifecycleSe
 import { participantTeamService } from '../../services/participantTeamService';
 import { evaluationPipelineService } from '../../services/evaluationPipelineService';
 import { AiEvaluationReportView } from '../../components/evaluation/AiEvaluationReportView';
+import { SubmissionIntegrityModal } from '../../components/integrity/SubmissionIntegrityModal';
 import { InferenceMode } from 'firebase/ai';
 import type { Competition } from '../../types/authAndCompetition';
 import type { ProjectSubmission, SubmissionStatus, TeamRecord, ParticipantRecord } from '../../types/submission';
@@ -57,6 +58,8 @@ export const SubmissionListPage: React.FC = () => {
   // Modals
   const [selectedSubmission, setSelectedSubmission] = useState<ProjectSubmission | null>(null);
   const [dossierModalOpen, setDossierModalOpen] = useState(false);
+  const [integrityModalOpen, setIntegrityModalOpen] = useState(false);
+  const [integritySubmission, setIntegritySubmission] = useState<ProjectSubmission | null>(null);
   const [overrideModalOpen, setOverrideModalOpen] = useState(false);
   const [overrideReason, setOverrideReason] = useState('');
   const [overrideNotes, setOverrideNotes] = useState('');
@@ -621,6 +624,19 @@ export const SubmissionListPage: React.FC = () => {
                         >
                           Dossier
                         </Button>
+
+                        {/* 4. Submission Integrity & Provenance Modal */}
+                        <Button
+                          variant="outline"
+                          size="xs"
+                          leftIcon={<ShieldCheck size={11} />}
+                          onClick={() => {
+                            setIntegritySubmission(sub);
+                            setIntegrityModalOpen(true);
+                          }}
+                        >
+                          Integrity
+                        </Button>
                       </div>
                     </TableCell>
                   </TableRow>
@@ -1046,6 +1062,24 @@ export const SubmissionListPage: React.FC = () => {
           )}
         </Modal>
       )}
+
+      {/* ── MODAL: SUBMISSION INTEGRITY & PROVENANCE ── */}
+      <SubmissionIntegrityModal
+        isOpen={integrityModalOpen}
+        onClose={() => {
+          setIntegrityModalOpen(false);
+          setIntegritySubmission(null);
+        }}
+        submission={integritySubmission}
+        organizerUser={{
+          id: currentUser?.uid || 'organizer',
+          name: currentUser?.displayName || 'Organizer',
+          role: 'ORGANIZER',
+        }}
+        onReportUpdated={() => {
+          refreshData();
+        }}
+      />
     </div>
   );
 };

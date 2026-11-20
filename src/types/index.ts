@@ -934,3 +934,5 @@ export type AdminPage =
   | 'score-events'
   | 'webhook-events'
   | 'settings';
+
+export * from './submissionIntegrity';
