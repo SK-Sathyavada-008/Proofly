@@ -44,6 +44,8 @@ import { judgeAssignmentService } from '../../services/judgeAssignmentService';
 import { resultsAndAnalyticsService } from '../../services/resultsAndAnalyticsService';
 import { scoringLedgerService } from '../../services/scoringLedgerService';
 import { governanceAuditService } from '../../services/governanceAuditService';
+import { OrganizerAppealsModal } from '../../components/appeals/OrganizerAppealsModal';
+import { MessageSquare } from 'lucide-react';
 import type { Competition } from '../../types/authAndCompetition';
 import type { JudgeRecord } from '../../types/judgeAndEvaluation';
 import type {
@@ -164,6 +166,7 @@ export const OrganizerResultsPage: React.FC = () => {
   );
   const [unpublishModalOpen, setUnpublishModalOpen] = useState(false);
   const [unpublishReason, setUnpublishReason] = useState('');
+  const [appealsModalOpen, setAppealsModalOpen] = useState(false);
   const [previewModalOpen, setPreviewModalOpen] = useState(false);
 
   // Entry breakdown & authorized adjustment modal
@@ -442,6 +445,15 @@ export const OrganizerResultsPage: React.FC = () => {
               onClick={handleExportCsv}
             >
               Export CSV
+            </Button>
+
+            <Button
+              variant="outline"
+              size="xs"
+              leftIcon={<MessageSquare size={13} />}
+              onClick={() => setAppealsModalOpen(true)}
+            >
+              Appeals
             </Button>
 
             {isPublished ? (
@@ -1725,6 +1737,22 @@ export const OrganizerResultsPage: React.FC = () => {
           </div>
         )}
       </Modal>
+
+      {/* ── MODAL: PARTICIPANT APPEALS CONSOLE ── */}
+      <OrganizerAppealsModal
+        isOpen={appealsModalOpen}
+        onClose={() => setAppealsModalOpen(false)}
+        competitionId={selectedCompId}
+        competitionTitle={activeCompetition?.title || ''}
+        organizerUser={{
+          id: currentUser?.uid || organizerId,
+          name: currentUser?.displayName || organizerName,
+          role: 'ORGANIZER',
+        }}
+        onAppealResolved={() => {
+          refreshData();
+        }}
+      />
     </div>
   );
 };

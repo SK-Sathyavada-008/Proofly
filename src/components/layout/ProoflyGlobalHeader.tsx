@@ -3,6 +3,7 @@ import { NavLink, Link, useLocation, useNavigate } from 'react-router-dom';
 import { ChevronDown, Check, Sun, Moon, LogOut, LogIn } from 'lucide-react';
 import { useProoflyAuth } from '../../context/ProoflyAuthContext';
 import { useTheme } from '../../context/ThemeContext';
+import { NotificationCenter } from '../notifications/NotificationCenter';
 
 export const ProoflyGlobalHeader: React.FC = () => {
   const location = useLocation();
@@ -171,8 +172,10 @@ export const ProoflyGlobalHeader: React.FC = () => {
           })}
         </nav>
 
-        {/* Right: Theme Toggle & User Switcher */}
+        {/* Right: Notifications, Theme Toggle & User Switcher */}
         <div className="flex items-center gap-1.5 shrink-0">
+          <NotificationCenter />
+
           <button
             type="button"
             onClick={toggleTheme}

@@ -13,6 +13,11 @@ import {
   Save,
   Send,
   ExternalLink,
+  Trophy,
+  MessageSquare,
+  HelpCircle,
+  Megaphone,
+  Sparkles,
 } from 'lucide-react';
 import { Card } from '../../components/ui/Card';
 import { Badge } from '../../components/ui/Badge';
@@ -23,9 +28,15 @@ import { useToast } from '../../components/ui/Toast';
 import { submissionService } from '../../services/submissionService';
 import { competitionService } from '../../services/competitionService';
 import { fileStorageService } from '../../services/fileStorageService';
+import { appealService } from '../../services/appealService';
+import { ParticipantAppealModal } from '../../components/appeals/ParticipantAppealModal';
 import { useProoflyAuth } from '../../context/ProoflyAuthContext';
 import { ALL_SUBMISSION_STATUSES, type ProjectSubmission } from '../../types/submission';
 import type { Competition } from '../../types/authAndCompetition';
+import type {
+  EvaluationAppeal,
+  ParticipantReleasedFeedback,
+} from '../../types/appealsAndNotifications';
 
 export const ParticipantSubmissionManagePage: React.FC = () => {
   const [searchParams] = useSearchParams();
@@ -53,6 +64,15 @@ export const ParticipantSubmissionManagePage: React.FC = () => {
   const [videoUrl, setVideoUrl] = useState('');
   const [changeSummary, setChangeSummary] = useState('');
   const [isUpdating, setIsUpdating] = useState(false);
+
+  // Feedback & Appeals State (Phase 14)
+  const [activeTab, setActiveTab] = useState<'submission' | 'feedback_appeals'>('submission');
+  const [feedback, setFeedback] = useState<ParticipantReleasedFeedback | null>(null);
+  const [appeals, setAppeals] = useState<EvaluationAppeal[]>([]);
+  const [isAppealModalOpen, setIsAppealModalOpen] = useState(false);
+  const [respondingToReqId, setRespondingToReqId] = useState<string | null>(null);
+  const [responseContent, setResponseContent] = useState('');
+  const [isSubmittingResponse, setIsSubmittingResponse] = useState(false);
 
   const verifyAndLoadSubmission = useCallback(
     async (ref: string, token: string) => {
@@ -88,6 +108,16 @@ export const ParticipantSubmissionManagePage: React.FC = () => {
         setGithubUrl(sub.githubUrl || '');
         setDeploymentUrl(sub.deploymentUrl || '');
         setVideoUrl(sub.videoUrl || '');
+
+        // Phase 14: Load participant feedback & appeals
+        try {
+          const fb = await appealService.getParticipantFeedback(sub, { token: token.trim() });
+          setFeedback(fb);
+          const applList = await appealService.listAppealsForSubmission(sub.id);
+          setAppeals(applList);
+        } catch (fbErr) {
+          console.warn('Could not load feedback or appeals:', fbErr);
+        }
 
         success('Authenticated', `Management access verified for ${sub.referenceId}.`);
       } catch (err: any) {
@@ -134,6 +164,43 @@ export const ParticipantSubmissionManagePage: React.FC = () => {
       toastError('Update Failed', err.message);
     } finally {
       setIsUpdating(false);
+    }
+  };
+
+  const handleRespondToInformation = async (appealId: string, reqId: string) => {
+    if (!responseContent.trim()) {
+      toastError('Response Required', 'Please enter your clarification response.');
+      return;
+    }
+    setIsSubmittingResponse(true);
+    try {
+      const updated = await appealService.respondToInformationRequest(
+        appealId,
+        reqId,
+        responseContent.trim(),
+        { id: currentUser?.uid, name: submission?.primaryContactName || (submission as any)?.submitterName || 'Participant' }
+      );
+      setAppeals((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
+      setRespondingToReqId(null);
+      setResponseContent('');
+      success('Response Submitted', 'Your clarification has been submitted to the organizers.');
+    } catch (err: any) {
+      toastError('Response Failed', err.message);
+    } finally {
+      setIsSubmittingResponse(false);
+    }
+  };
+
+  const handleWithdrawAppeal = async (appealId: string) => {
+    try {
+      const updated = await appealService.withdrawAppeal(
+        appealId,
+        { id: currentUser?.uid || 'participant', name: submission?.primaryContactName || (submission as any)?.submitterName || 'Participant', role: 'PARTICIPANT' }
+      );
+      setAppeals((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
+      success('Appeal Withdrawn', 'Your appeal has been withdrawn.');
+    } catch (err: any) {
+      toastError('Withdraw Failed', err.message);
     }
   };
 
@@ -287,8 +354,46 @@ export const ParticipantSubmissionManagePage: React.FC = () => {
         )}
       </div>
 
-      {/* Main Workspace Grid: Edit Form on Left, Version History & Artifacts on Right */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      {/* ── WORKSPACE TABS ── */}
+      <div className="flex items-center gap-2 border-b border-slate-200 dark:border-slate-800 pb-2">
+        <button
+          type="button"
+          onClick={() => setActiveTab('submission')}
+          className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+            activeTab === 'submission'
+              ? 'bg-blue-600 text-white shadow-xs'
+              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+          }`}
+        >
+          <FileText size={14} />
+          <span>Submission & Artifacts</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveTab('feedback_appeals')}
+          className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer relative ${
+            activeTab === 'feedback_appeals'
+              ? 'bg-blue-600 text-white shadow-xs'
+              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+          }`}
+        >
+          <Trophy size={14} />
+          <span>Evaluation Feedback & Appeals</span>
+          {feedback?.isResultsReleased && (
+            <span className="w-2 h-2 rounded-full bg-amber-400 ring-2 ring-white" />
+          )}
+          {appeals.length > 0 && (
+            <Badge variant="neutral" size="sm" className="ml-1 text-[10px]">
+              {appeals.length}
+            </Badge>
+          )}
+        </button>
+      </div>
+
+      {/* ── TAB 1: SUBMISSION DETAILS & ARTIFACTS ── */}
+      {activeTab === 'submission' && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left Column (2/3): Edit Form */}
         <div className="lg:col-span-2 space-y-6">
           <Card className="p-6 bg-white dark:bg-slate-900 border-slate-200/90 dark:border-slate-800 shadow-2xs space-y-4">
@@ -522,6 +627,318 @@ export const ParticipantSubmissionManagePage: React.FC = () => {
           </Card>
         </div>
       </div>
+      )}
+
+      {/* ── TAB 2: EVALUATION RESULTS & PARTICIPANT APPEALS ── */}
+      {activeTab === 'feedback_appeals' && (
+        <div className="space-y-6">
+          {/* Section 1: Official Results & Feedback */}
+          {feedback?.isResultsReleased ? (
+            <div className="space-y-6">
+              {/* Score Header Card */}
+              <div className="p-6 rounded-2xl bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 text-white shadow-md flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <Trophy size={20} className="text-amber-300" />
+                    <span className="font-bold text-sm tracking-wide uppercase opacity-90">
+                      Official Released Evaluation
+                    </span>
+                  </div>
+                  <h2 className="text-3xl font-extrabold tracking-tight">
+                    {feedback.publishedScore} <span className="text-lg font-normal opacity-80">/ {feedback.maxPossibleScore} pts</span>
+                  </h2>
+                  <p className="text-xs opacity-90">
+                    Percentage Score: <strong>{feedback.percentageScore}%</strong> · Released on {feedback.releasedAt ? new Date(feedback.releasedAt).toLocaleDateString() : 'Official Publication'}
+                  </p>
+                </div>
+
+                <div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="bg-white/10 hover:bg-white/20 border-white/30 text-white"
+                    onClick={() => setIsAppealModalOpen(true)}
+                    leftIcon={<MessageSquare size={13} />}
+                  >
+                    Raise Criterion Appeal
+                  </Button>
+                </div>
+              </div>
+
+              {/* Criterion-wise Breakdown */}
+              <div className="space-y-3">
+                <h3 className="font-bold text-slate-900 dark:text-slate-100 text-xs uppercase tracking-wider flex items-center gap-2">
+                  <Sparkles size={14} className="text-blue-600 dark:text-blue-400" />
+                  <span>Criterion-wise Released Feedback</span>
+                </h3>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {feedback.criterionFeedback.map((crit) => (
+                    <Card key={crit.criterionId} className="p-4 bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-xs text-slate-800 dark:text-slate-200">
+                          {crit.criterionName}
+                        </span>
+                        <span className="font-mono font-bold text-xs text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/40 px-2 py-0.5 rounded">
+                          {crit.awardedScore} / {crit.maxScore} pts
+                        </span>
+                      </div>
+
+                      {crit.releasedComments && crit.releasedComments.length > 0 ? (
+                        <div className="space-y-1 pt-1">
+                          {crit.releasedComments.map((comment, i) => (
+                            <p key={i} className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed italic bg-slate-50 dark:bg-slate-800/40 p-2 rounded">
+                              "{comment}"
+                            </p>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-[11px] text-slate-400 italic">No specific feedback comments released for this criterion.</p>
+                      )}
+                    </Card>
+                  ))}
+                </div>
+              </div>
+
+              {/* Published AI Assessment (if enabled) */}
+              {feedback.publishedAiAssessment && (
+                <div className="p-4 rounded-xl bg-purple-50/60 dark:bg-purple-950/20 border border-purple-200/80 dark:border-purple-900/40 space-y-2 text-xs">
+                  <div className="flex items-center gap-2 font-bold text-purple-900 dark:text-purple-200">
+                    <Sparkles size={14} className="text-purple-600 dark:text-purple-400" />
+                    <span>Automated AI Evaluation Guidance</span>
+                  </div>
+                  <p className="text-[11px] text-purple-950/80 dark:text-purple-300/80 leading-relaxed">
+                    {feedback.publishedAiAssessment.summary}
+                  </p>
+                  <p className="text-[10px] text-purple-500 italic">
+                    {feedback.publishedAiAssessment.disclaimer}
+                  </p>
+                </div>
+              )}
+            </div>
+          ) : (
+            <Card className="p-8 text-center bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 space-y-3">
+              <Trophy size={36} className="mx-auto text-slate-300 dark:text-slate-600 stroke-[1.5]" />
+              <div className="space-y-1">
+                <h3 className="font-bold text-sm text-slate-800 dark:text-slate-200">Official Results Pending</h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+                  Official evaluation scores, rubric breakdown, and judge feedback will be visible here as soon as competition organizers finalize and release results.
+                </p>
+              </div>
+              <Badge variant="neutral" size="sm">
+                Status: {submission.status}
+              </Badge>
+            </Card>
+          )}
+
+          {/* Announcements Banner */}
+          {feedback?.announcements && feedback.announcements.length > 0 && (
+            <div className="space-y-2 pt-2">
+              <h3 className="font-bold text-slate-900 dark:text-slate-100 text-xs uppercase tracking-wider flex items-center gap-2">
+                <Megaphone size={14} className="text-amber-500" />
+                <span>Competition Announcements ({feedback.announcements.length})</span>
+              </h3>
+              <div className="space-y-2">
+                {feedback.announcements.map((ann) => (
+                  <div
+                    key={ann.id}
+                    className="p-3 bg-amber-50/70 dark:bg-amber-950/20 rounded-xl border border-amber-200 dark:border-amber-900/40 text-xs space-y-1"
+                  >
+                    <div className="flex items-center justify-between font-bold text-amber-900 dark:text-amber-200">
+                      <span>{ann.title}</span>
+                      <span className="text-[10px] text-slate-400">{new Date(ann.publishedAt).toLocaleDateString()}</span>
+                    </div>
+                    <p className="text-[11px] text-amber-950/80 dark:text-amber-300/80 leading-relaxed">{ann.content}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Section 2: Raised Appeals & Status */}
+          <div className="space-y-3 pt-4 border-t border-slate-200 dark:border-slate-800">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-slate-900 dark:text-slate-100 text-xs uppercase tracking-wider flex items-center gap-2">
+                <MessageSquare size={14} className="text-blue-600 dark:text-blue-400" />
+                <span>Your Evaluation Appeals ({appeals.length})</span>
+              </h3>
+
+              <Button
+                variant="outline"
+                size="xs"
+                onClick={() => setIsAppealModalOpen(true)}
+                leftIcon={<MessageSquare size={12} />}
+              >
+                Raise Appeal
+              </Button>
+            </div>
+
+            {appeals.length === 0 ? (
+              <div className="p-6 bg-slate-50 dark:bg-slate-900/50 rounded-xl border border-slate-200 dark:border-slate-800 text-center text-slate-400 text-xs">
+                No appeals submitted. If you believe a rubric criterion was scored incorrectly or critical evidence was missed, you may raise an appeal above.
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {appeals.map((appeal) => (
+                  <Card key={appeal.id} className="p-4 bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 space-y-3 text-xs">
+                    <div className="flex items-start justify-between gap-2 flex-wrap">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-slate-900 dark:text-slate-100">{appeal.criterionName}</span>
+                          <span className="text-slate-400">·</span>
+                          <span className="font-mono text-[11px] text-blue-600 dark:text-blue-400">{appeal.id}</span>
+                        </div>
+                        <span className="text-[11px] text-slate-500 block mt-0.5">
+                          Reason: <strong>{appeal.reason}</strong> · Submitted {new Date(appeal.submittedAt).toLocaleDateString()}
+                        </span>
+                      </div>
+                      <Badge
+                        variant={
+                          appeal.status === 'RESOLVED'
+                            ? 'success'
+                            : appeal.status === 'REJECTED'
+                            ? 'danger'
+                            : appeal.status === 'NEEDS_INFORMATION'
+                            ? 'warning'
+                            : 'primary'
+                        }
+                        size="sm"
+                      >
+                        {appeal.status}
+                      </Badge>
+                    </div>
+
+                    <div className="p-2.5 bg-slate-50 dark:bg-slate-800/40 rounded border border-slate-200 dark:border-slate-800 text-[11px] leading-relaxed">
+                      {appeal.supportingExplanation}
+                    </div>
+
+                    {appeal.evidenceReferences && appeal.evidenceReferences.length > 0 && (
+                      <div className="flex items-center gap-1.5 flex-wrap text-[10px] text-slate-500">
+                        <span>Cited evidence:</span>
+                        {appeal.evidenceReferences.map((ref, idx) => (
+                          <span key={idx} className="font-mono bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded text-blue-600 dark:text-blue-400">
+                            {ref}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Information Request from Organizer */}
+                    {appeal.informationRequests && appeal.informationRequests.length > 0 && (
+                      <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+                        {appeal.informationRequests.map((req) => (
+                          <div key={req.id} className="p-3 bg-amber-50 dark:bg-amber-950/20 rounded-lg border border-amber-200 dark:border-amber-900/40 text-[11px] space-y-2">
+                            <div className="font-semibold text-amber-900 dark:text-amber-200 flex items-center justify-between">
+                              <span>Organizer Clarification Request:</span>
+                              <span className="text-[10px] text-slate-400">{new Date(req.requestedAt).toLocaleDateString()}</span>
+                            </div>
+                            <p className="text-amber-950/80 dark:text-amber-300/80">{req.question}</p>
+
+                            {req.response ? (
+                              <p className="text-emerald-800 dark:text-emerald-300 pl-2 border-l-2 border-emerald-500 font-medium">
+                                <strong>Your Response:</strong> {req.response}
+                              </p>
+                            ) : (
+                              <div className="space-y-2 pt-1">
+                                {respondingToReqId === req.id ? (
+                                  <div className="space-y-2">
+                                    <Textarea
+                                      rows={2}
+                                      value={responseContent}
+                                      onChange={(e) => setResponseContent(e.target.value)}
+                                      placeholder="Provide the requested details or code pointers..."
+                                      className="text-xs"
+                                    />
+                                    <div className="flex items-center gap-2">
+                                      <Button
+                                        variant="primary"
+                                        size="xs"
+                                        onClick={() => handleRespondToInformation(appeal.id, req.id)}
+                                        isLoading={isSubmittingResponse}
+                                      >
+                                        Submit Clarification
+                                      </Button>
+                                      <Button
+                                        variant="outline"
+                                        size="xs"
+                                        onClick={() => {
+                                          setRespondingToReqId(null);
+                                          setResponseContent('');
+                                        }}
+                                      >
+                                        Cancel
+                                      </Button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <Button
+                                    variant="outline"
+                                    size="xs"
+                                    onClick={() => setRespondingToReqId(req.id)}
+                                    leftIcon={<HelpCircle size={11} />}
+                                  >
+                                    Respond to Request
+                                  </Button>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Resolution Banner */}
+                    {appeal.resolution && (
+                      <div
+                        className={`p-3 rounded-lg border text-[11px] space-y-1 ${
+                          appeal.status === 'RESOLVED'
+                            ? 'bg-emerald-50 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-800 text-emerald-950 dark:text-emerald-200'
+                            : 'bg-rose-50 dark:bg-rose-950/20 border-rose-200 dark:border-rose-800 text-rose-950 dark:text-rose-200'
+                        }`}
+                      >
+                        <span className="font-bold block">Resolution: {appeal.status}</span>
+                        <p>{appeal.resolution}</p>
+                        {appeal.scoreAdjustment && (
+                          <span className="font-mono text-[10px] block mt-1">
+                            Score Adjusted to: <strong>{appeal.scoreAdjustment.newScore} pts</strong>
+                          </span>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Withdraw Button if still active */}
+                    {appeal.status !== 'RESOLVED' && appeal.status !== 'REJECTED' && appeal.status !== 'WITHDRAWN' && (
+                      <div className="flex justify-end pt-1">
+                        <Button
+                          variant="outline"
+                          size="xs"
+                          onClick={() => handleWithdrawAppeal(appeal.id)}
+                          className="text-slate-400 hover:text-rose-600"
+                        >
+                          Withdraw Appeal
+                        </Button>
+                      </div>
+                    )}
+                  </Card>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── MODAL: RAISE APPEAL ── */}
+      <ParticipantAppealModal
+        isOpen={isAppealModalOpen}
+        onClose={() => setIsAppealModalOpen(false)}
+        submission={submission}
+        competition={competition}
+        managementToken={tokenInput}
+        releasedCriteria={feedback?.criterionFeedback || []}
+        onAppealSubmitted={(newAppeal) => {
+          setAppeals((prev) => [newAppeal, ...prev]);
+        }}
+      />
     </div>
   );
 };
